@@ -110,8 +110,9 @@ export default defineConfig((options) => [
     define: {
       __VERSION__: JSON.stringify(VERSION),
     },
-    banner: {
-      js: '"use client";',
-    },
+    // Sin banner "use client": el build SSR de TanStack Start lo interpretaba como
+    // client boundary (estilo RSC) y desincronizaba la hidratación del documento
+    // entero (#418). El paquete ya se monta solo en cliente (gate del consumidor),
+    // así que el directivo no aporta nada acá.
   },
 ]);
