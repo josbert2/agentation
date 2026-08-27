@@ -41,37 +41,51 @@ function scssModulesPlugin(): Plugin {
 
           css = postcssResult.css;
 
-          // Generate JS that exports class names and injects styles (SSR-safe)
+          // Generate JS that exports class names and injects styles (SSR-safe +
+          // hydration-safe). Ver nota en la rama de abajo: la inyección se DIFIERE
+          // fuera del tick de hidratación de React.
           const contents = `
 const css = ${JSON.stringify(css)};
 const classNames = ${JSON.stringify(classNames)};
 
-// SSR-safe style injection (always update for HMR)
 if (typeof document !== 'undefined') {
-  let style = document.getElementById('feedback-tool-styles-${styleId}');
-  if (!style) {
-    style = document.createElement('style');
-    style.id = 'feedback-tool-styles-${styleId}';
-    document.head.appendChild(style);
-  }
-  style.textContent = css;
+  var __apply = function () {
+    var style = document.getElementById('feedback-tool-styles-${styleId}');
+    if (!style) {
+      style = document.createElement('style');
+      style.id = 'feedback-tool-styles-${styleId}';
+      document.head.appendChild(style);
+    }
+    style.textContent = css;
+  };
+  // NO mutar <head> mientras React hidrata: en hosts que hidratan el <html>
+  // entero (TanStack Start SSR) un appendChild al <head> durante la hidratación
+  // rompe la hidratación (React #418) en TODO el árbol. Se difiere con doble rAF
+  // (post-commit + post-paint), o setTimeout como fallback.
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(function () { requestAnimationFrame(__apply); });
+  else setTimeout(__apply, 0);
 }
 
 export default classNames;
 `;
           return { contents, loader: "js" };
         } else {
-          // Regular SCSS - no CSS modules processing
+          // Regular SCSS - no CSS modules processing. Inyección diferida igual
+          // que en la rama de arriba (hydration-safe).
           const contents = `
 const css = ${JSON.stringify(css)};
 if (typeof document !== 'undefined') {
-  let style = document.getElementById('feedback-tool-styles-${styleId}');
-  if (!style) {
-    style = document.createElement('style');
-    style.id = 'feedback-tool-styles-${styleId}';
-    document.head.appendChild(style);
-  }
-  style.textContent = css;
+  var __apply = function () {
+    var style = document.getElementById('feedback-tool-styles-${styleId}');
+    if (!style) {
+      style = document.createElement('style');
+      style.id = 'feedback-tool-styles-${styleId}';
+      document.head.appendChild(style);
+    }
+    style.textContent = css;
+  };
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(function () { requestAnimationFrame(__apply); });
+  else setTimeout(__apply, 0);
 }
 export default {};
 `;
