@@ -4312,6 +4312,27 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
                 return false;
               }
             }}
+            onCopyFrame={async (frame, detail) => {
+              // Copia UN solo frame (el seleccionado en el panel), en el formato
+              // elegido. Es lo que hace el botón "Copiar": cada pantalla va
+              // individual, no todas juntas.
+              const displayUrl =
+                typeof window !== "undefined"
+                  ? window.location.pathname +
+                    window.location.search +
+                    window.location.hash
+                  : pathname;
+              const output = generateOutput([frame], displayUrl, detail);
+              if (!output) return false;
+              try {
+                if (copyToClipboard)
+                  await navigator.clipboard.writeText(output);
+                onCopy?.(output);
+                return true;
+              } catch {
+                return false;
+              }
+            }}
             getOutput={(detail) => {
               // Mismo markdown que copiaría, pero para previsualizarlo en el modal.
               const displayUrl =
