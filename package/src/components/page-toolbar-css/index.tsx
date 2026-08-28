@@ -20,6 +20,7 @@ import {
   IconChevronLeft,
   IconChevronRight,
   IconLayout,
+  IconFrames,
 } from "../icons";
 import { HelpTooltip } from "../help-tooltip";
 import { DesignMode } from "../design-mode";
@@ -88,6 +89,8 @@ import styles from "./styles.module.scss";
 import { generateOutput } from "../../utils/generate-output";
 import { AnnotationMarker, ExitingMarker, PendingMarker } from "./annotation-marker";
 import { SettingsPanel } from "./settings-panel";
+import { ChangesPanel } from "./changes-panel";
+import { captureDomRegion } from "../../utils/screenshot";
 
 /**
  * Composes element identification with React component detection.
@@ -313,6 +316,63 @@ export type PageFeedbackToolbarCSSProps = {
   webhookUrl?: string;
   /** Custom class name applied to the toolbar container. Use to adjust positioning or z-index. */
   className?: string;
+  /** Si true, no se renderiza el trigger flotante colapsado propio (el círculo
+   *  que aparece cuando el toolbar no está activo). Pensado para embeber
+   *  agentation en un botón del consumidor: cuando NO está activo no se muestra
+   *  nada flotando, y se activa desde afuera despachando el evento global
+   *  `window.dispatchEvent(new Event("agentation:toggle"))`. Cuando SÍ está
+   *  activo, el toolbar expandido se muestra normal. */
+  externalTrigger?: boolean;
+  /** Si está seteado, cada screenshot capturado se sube con POST { id, dataUrl }
+   *  a esta URL; se espera { url } de vuelta y se guarda en la anotación como
+   *  `screenshotUrl` (para que el copiar referencie la imagen por URL). */
+  screenshotUploadUrl?: string;
+  /** Headers extra para el POST de subida del screenshot (ej. Authorization). */
+  screenshotUploadHeaders?: Record<string, string>;
+
+  // ---------------------------------------------------------------------------
+  // Modo requerimiento (ticket)
+  // ---------------------------------------------------------------------------
+  /** Si true, al marcar un elemento el popup muestra el form de requerimiento. */
+  requerimientoMode?: boolean;
+  /** Opciones de prioridad para el form de requerimiento. */
+  prioridades?: { value: string; label: string; color: string }[];
+  /** Responsables asignables en el form de requerimiento. */
+  responsables?: { email: string; nombre: string }[];
+  /** Crea el requerimiento. Devuelve true si salió bien.
+   *  @deprecated El flujo ahora agrega frames al Panel de Cambios y los envía en
+   *  lote con `onEnviarRequerimientos`. Se mantiene por compatibilidad. */
+  onCreateRequerimiento?: (d: {
+    titulo: string;
+    prioridad: string;
+    responsable: string | null;
+    descripcion: string;
+    screenshot?: string;
+    pageUrl: string;
+  }) => Promise<boolean>;
+  /** Envía en lote los requerimientos armados en el Panel de Cambios. Devuelve
+   *  cuántos se crearon (ok) y cuántos fallaron (fail). */
+  onEnviarRequerimientos?: (
+    items: {
+      titulo?: string;
+      prioridad?: string;
+      responsable?: string | null;
+      descripcion: string;
+      screenshot?: string;
+      video?: string;
+      pageUrl?: string;
+      agentationCopy?: string;
+    }[],
+  ) => Promise<{ ok: number; fail: number }>;
+  /** Redacta/mejora la descripción del requerimiento con IA a partir del
+   *  contexto (borrador + pantalla). Devuelve el texto sugerido o null. */
+  onAssistDescripcion?: (ctx: {
+    titulo: string;
+    borrador: string;
+    elemento: string;
+    seleccion: string;
+    prioridad: string;
+  }) => Promise<string | null>;
 };
 
 /** Alias for PageFeedbackToolbarCSSProps */
@@ -337,13 +397,52 @@ export function PageFeedbackToolbarCSS({
   sessionId: initialSessionId,
   onSessionCreated,
   webhookUrl,
+  screenshotUploadUrl,
+  screenshotUploadHeaders,
+  requerimientoMode = false,
+  prioridades,
+  responsables,
+  onCreateRequerimiento,
+  onEnviarRequerimientos,
+  onAssistDescripcion,
   className: userClassName,
+  externalTrigger = false,
 }: PageFeedbackToolbarCSSProps = {}) {
   const [isActive, setIsActive] = useState(false);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [showMarkers, setShowMarkers] = useState(true);
   const [isToolbarHidden, setIsToolbarHidden] = useState(() => loadToolbarHidden());
   const [isToolbarHiding, setIsToolbarHiding] = useState(false);
+
+  // Activación externa: el consumidor puede activar/alternar agentation desde
+  // su propio botón despachando `window.dispatchEvent(new Event("agentation:toggle"))`.
+  // Es aditivo: funciona siempre, pero está pensado para usarse junto con
+  // `externalTrigger` (que esconde el trigger flotante propio).
+  useEffect(() => {
+    const handleToggle = () => {
+      // El trigger externo (la píldora de relay) es LA forma de abrir agentation,
+      // así que tiene que ganarle a un toolbar previamente escondido: si no,
+      // `isToolbarHidden` hacía que el componente renderizara null y el click "no
+      // hacía nada". Des-ocultamos y activamos.
+      saveToolbarHidden(false);
+      setIsToolbarHidden(false);
+      setIsActive((v) => !v);
+    };
+    window.addEventListener("agentation:toggle", handleToggle);
+    return () => window.removeEventListener("agentation:toggle", handleToggle);
+  }, []);
+
+  // Mientras se graba la pantalla (evento que despacha el popup), escondemos la
+  // píldora del toolbar y el marcador para que NO salgan en el video. El popup
+  // sigue montado (tiene el MediaRecorder); sólo ocultamos el "chrome".
+  const [recordingActive, setRecordingActive] = useState(false);
+  useEffect(() => {
+    const onRec = (e: Event) => {
+      setRecordingActive(!!(e as CustomEvent).detail?.recording);
+    };
+    window.addEventListener("agentation:recording", onRec as EventListener);
+    return () => window.removeEventListener("agentation:recording", onRec as EventListener);
+  }, []);
 
   // Stop native events from bubbling past document.body when they originate
   // inside the toolbar portal. Without this, clicks on the toolbar propagate to
@@ -365,6 +464,26 @@ export function PageFeedbackToolbarCSS({
       events.forEach((evt) => document.body.removeEventListener(evt, stop));
     };
   }, []);
+
+  // Mientras el overlay está ACTIVO, evitar que los componentes "dismissable" de
+  // la app (drawers, modales, dropdowns de Radix, etc.) se cierren cuando tocás
+  // sobre ellos para anotarlos. Esos componentes se cierran con `pointerdown`
+  // afuera; agentation, en cambio, selecciona con `click` y arrastra con
+  // `mousedown` —eventos DISTINTOS—, así que frenamos SOLO el `pointerdown` en
+  // fase de captura a nivel window (antes que cualquier listener de la app), y
+  // únicamente cuando NO nace de la propia UI de agentation. El anotar sigue
+  // andando; el drawer queda abierto para poder capturarlo.
+  useEffect(() => {
+    if (!isActive) return;
+    const bloquearDismiss = (e: PointerEvent) => {
+      const t = e.target as Element | null;
+      if (t && t.closest("[data-agentation-root]")) return; // UI propia: dejar pasar
+      e.stopImmediatePropagation();
+    };
+    window.addEventListener("pointerdown", bloquearDismiss, true);
+    return () =>
+      window.removeEventListener("pointerdown", bloquearDismiss, true);
+  }, [isActive]);
 
   // Unified marker visibility state - controls both toolbar and eye toggle
   const [markersVisible, setMarkersVisible] = useState(false);
@@ -401,6 +520,8 @@ export function PageFeedbackToolbarCSS({
     // Element reference for single-select (for live position queries)
     targetElement?: HTMLElement;
   } | null>(null);
+  // Screenshot capturado del elemento pendiente (para el form de requerimiento)
+  const [pendingScreenshot, setPendingScreenshot] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [sendState, setSendState] = useState<
     "idle" | "sending" | "sent" | "failed"
@@ -429,6 +550,8 @@ export function PageFeedbackToolbarCSS({
   const [isFrozen, setIsFrozen] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showSettingsVisible, setShowSettingsVisible] = useState(false);
+  const [showChanges, setShowChanges] = useState(false);
+  const [showChangesVisible, setShowChangesVisible] = useState(false);
   const [settingsPage, setSettingsPage] = useState<"main" | "automations">(
     "main",
   );
@@ -646,6 +769,17 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
       return () => clearTimeout(timer);
     }
   }, [showSettings]);
+
+  // Handle showChanges changes with exit animation
+  useEffect(() => {
+    if (showChanges) {
+      setShowChangesVisible(true);
+    } else {
+      setTooltipsHidden(false);
+      const timer = originalSetTimeout(() => setShowChangesVisible(false), 0);
+      return () => clearTimeout(timer);
+    }
+  }, [showChanges]);
 
   // Unified marker visibility - depends on toolbar active, showMarkers toggle, and not blank canvas
   // This single effect handles all marker show/hide animations
@@ -1132,6 +1266,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
     if (isToolbarHiding) return;
     setIsToolbarHiding(true);
     setShowSettings(false);
+    setShowChanges(false);
     setIsActive(false);
     originalSetTimeout(() => {
       saveToolbarHidden(true);
@@ -1775,6 +1910,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
       setEditingTargetElements([]);
       setHoverInfo(null);
       setShowSettings(false); // Close settings when toolbar closes
+      setShowChanges(false); // Close changes panel when toolbar closes
       setPendingMultiSelectElements([]); // Clear multi-select
       modifiersHeldRef.current = { cmd: false, shift: false }; // Reset modifier tracking
       if (isFrozen) {
@@ -2589,7 +2725,15 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
 
   // Add annotation
   const addAnnotation = useCallback(
-    (comment: string) => {
+    (
+      comment: string,
+      extra?: {
+        screenshot?: string;
+        video?: string;
+        videoSeconds?: number;
+        req?: { titulo?: string; prioridad?: string; responsable?: string | null };
+      },
+    ) => {
       if (!pendingAnnotation) return;
 
       const newAnnotation: Annotation = {
@@ -2613,6 +2757,11 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
         reactComponents: pendingAnnotation.reactComponents,
         sourceFile: pendingAnnotation.sourceFile,
         elementBoundingBoxes: pendingAnnotation.elementBoundingBoxes,
+        // Modo requerimiento: captura MARCADA + datos del requerimiento (el
+        // popup los pasa al "Agregar"). El frame vive en el Panel de Cambios.
+        ...(extra?.screenshot ? { screenshot: extra.screenshot } : {}),
+        ...(extra?.video ? { video: extra.video, videoSeconds: extra.videoSeconds } : {}),
+        ...(extra?.req ? { req: extra.req } : {}),
         // Protocol fields for server sync
         ...(endpoint && currentSessionId
           ? {
@@ -2627,6 +2776,91 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
       };
 
       setAnnotations((prev) => [...prev, newAnnotation]);
+
+      // Modo requerimiento: la captura MARCADA ya viene en extra.screenshot. La
+      // subimos a S3 acá (al Agregar) para tener la URL pública lista antes de
+      // copiar — así el "Copiar" del panel la trae en el texto y no rompemos el
+      // gesto del clipboard subiendo en el momento del copy.
+      if (extra?.screenshot && screenshotUploadUrl) {
+        fetch(screenshotUploadUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(screenshotUploadHeaders ?? {}),
+          },
+          body: JSON.stringify({ id: newAnnotation.id, dataUrl: extra.screenshot }),
+        })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((res) => {
+            const url = res && typeof res.url === "string" ? res.url : null;
+            if (!url) return;
+            setAnnotations((prev) =>
+              prev.map((a) =>
+                a.id === newAnnotation.id ? { ...a, screenshotUrl: url } : a,
+              ),
+            );
+          })
+          .catch(() => {
+            /* sin URL: el copy va igual, sólo sin la línea de imagen */
+          });
+      }
+
+      // Capture a screenshot of the annotated region (async, best-effort).
+      // The annotation is created immediately without a screenshot; when the
+      // capture resolves we attach it to the annotation by id (which also
+      // persists it to storage via the save effect). captureDomRegion hides
+      // the agentation UI while capturing, so markers/popup don't appear.
+      const captureBox = newAnnotation.boundingBox;
+      if (captureBox && !extra?.screenshot) {
+        const regionY = newAnnotation.isFixed
+          ? captureBox.y
+          : captureBox.y - window.scrollY;
+        captureDomRegion(
+          captureBox.x,
+          regionY,
+          captureBox.width,
+          captureBox.height,
+          [],
+        )
+          .then((dataUrl) => {
+            if (!dataUrl) return; // No capture (dep missing / failed) → placeholder
+            setAnnotations((prev) =>
+              prev.map((a) =>
+                a.id === newAnnotation.id ? { ...a, screenshot: dataUrl } : a,
+              ),
+            );
+            // Sube la captura a un endpoint (S3) si está configurado, y guarda la
+            // URL pública en la anotación — así el "copiar" referencia la imagen
+            // por URL (que el agente puede abrir) en vez del data URL crudo.
+            if (screenshotUploadUrl) {
+              fetch(screenshotUploadUrl, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  ...(screenshotUploadHeaders ?? {}),
+                },
+                body: JSON.stringify({ id: newAnnotation.id, dataUrl }),
+              })
+                .then((r) => (r.ok ? r.json() : null))
+                .then((res) => {
+                  const url = res && typeof res.url === "string" ? res.url : null;
+                  if (!url) return;
+                  setAnnotations((prev) =>
+                    prev.map((a) =>
+                      a.id === newAnnotation.id
+                        ? { ...a, screenshotUrl: url }
+                        : a,
+                    ),
+                  );
+                })
+                .catch(() => {});
+            }
+          })
+          .catch((err) => {
+            console.warn("[Agentation] Screenshot capture failed:", err);
+          });
+      }
+
       // Prevent immediate hover on newly added marker
       recentlyAddedIdRef.current = newAnnotation.id;
       originalSetTimeout(() => {
@@ -2694,6 +2928,31 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
       setPendingExiting(false);
     }, 150); // Match exit animation duration
   }, []);
+
+  // En modo requerimiento, capturar el screenshot del elemento apenas se abre el
+  // popup, para mostrarlo como thumbnail y poder enviarlo al crear. captureDomRegion
+  // oculta la UI de agentation durante la captura.
+  useEffect(() => {
+    if (!requerimientoMode) return;
+    if (!pendingAnnotation || !pendingAnnotation.boundingBox) {
+      setPendingScreenshot(null);
+      return;
+    }
+    let cancelled = false;
+    setPendingScreenshot(null);
+    const box = pendingAnnotation.boundingBox;
+    const regionY = pendingAnnotation.isFixed ? box.y : box.y - window.scrollY;
+    captureDomRegion(box.x, regionY, box.width, box.height, [])
+      .then((dataUrl) => {
+        if (!cancelled && dataUrl) setPendingScreenshot(dataUrl);
+      })
+      .catch((err) => {
+        console.warn("[Agentation] Requerimiento capture failed:", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [requerimientoMode, pendingAnnotation]);
 
   // Delete annotation with exit animation
   const deleteAnnotation = useCallback(
@@ -3564,7 +3823,12 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
 
   return createPortal(
     <div ref={portalWrapperRef} style={{ display: "contents" }} data-agentation-theme={isDarkMode ? "dark" : "light"} data-agentation-accent={settings.annotationColorId} data-agentation-root="">
-      {/* Toolbar */}
+      {/* Toolbar — con externalTrigger no se renderiza el trigger flotante
+          colapsado: sólo aparece cuando el toolbar está activo. Se esconde
+          mientras se graba la pantalla (no salir en el video) y mientras el form
+          de requerimiento está abierto (chocaba con el popup). */}
+      {(!externalTrigger || isActive) && !recordingActive &&
+        !(requerimientoMode && pendingAnnotation) && (
       <div
         className={`${styles.toolbar}${userClassName ? ` ${userClassName}` : ""}`}
         data-feedback-toolbar
@@ -3800,7 +4064,30 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
                 onClick={(e) => {
                   e.stopPropagation();
                   hideTooltipsUntilMouseLeave();
+                  if (showSettings) setShowSettings(false);
+                  if (pendingAnnotation) cancelAnnotation();
+                  setShowChanges((v) => !v);
+                }}
+                data-active={showChanges}
+              >
+                <IconFrames size={24} />
+                {hasAnnotations && (
+                  <span className={styles.buttonBadge}>
+                    {annotations.length}
+                  </span>
+                )}
+              </button>
+              <span className={styles.buttonTooltip}>Cambios</span>
+            </div>
+
+            <div className={styles.buttonWrapper}>
+              <button
+                className={styles.controlButton}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  hideTooltipsUntilMouseLeave();
                   if (isDesignMode) closeDesignMode();
+                  if (showChanges) setShowChanges(false);
                   setShowSettings(!showSettings);
                 }}
               >
@@ -3997,8 +4284,82 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
             onSettingsPageChange={setSettingsPage}
             onHideToolbar={hideToolbarTemporarily}
           />
+
+          <ChangesPanel
+            annotations={annotations}
+            onDelete={deleteAnnotation}
+            onCopyFrames={async (detail) => {
+              // Copia los frames (anotaciones de feedback) como markdown
+              // estructurado, en el formato elegido en el panel. Reusa el mismo
+              // generador que el copiar del toolbar.
+              const displayUrl =
+                typeof window !== "undefined"
+                  ? window.location.pathname +
+                    window.location.search +
+                    window.location.hash
+                  : pathname;
+              const feedback = annotations.filter(
+                (a) => (a.kind === undefined || a.kind === "feedback") && a.comment,
+              );
+              const output = generateOutput(feedback, displayUrl, detail);
+              if (!output) return false;
+              try {
+                if (copyToClipboard)
+                  await navigator.clipboard.writeText(output);
+                onCopy?.(output);
+                return true;
+              } catch {
+                return false;
+              }
+            }}
+            getOutput={(detail) => {
+              // Mismo markdown que copiaría, pero para previsualizarlo en el modal.
+              const displayUrl =
+                typeof window !== "undefined"
+                  ? window.location.pathname +
+                    window.location.search +
+                    window.location.hash
+                  : pathname;
+              const feedback = annotations.filter(
+                (a) => (a.kind === undefined || a.kind === "feedback") && a.comment,
+              );
+              return generateOutput(feedback, displayUrl, detail);
+            }}
+            frameCopy={(frame) => {
+              // Copy en markdown de un solo frame: es lo que se guarda con el
+              // requerimiento para verlo/copiarlo después en la ficha de relay.
+              const displayUrl =
+                typeof window !== "undefined"
+                  ? window.location.pathname +
+                    window.location.search +
+                    window.location.hash
+                  : pathname;
+              return generateOutput([frame], displayUrl, "standard");
+            }}
+            prioridades={prioridades}
+            responsables={responsables}
+            onUpdateFrame={(id, patch) => {
+              setAnnotations((prev) =>
+                prev.map((a) =>
+                  a.id === id
+                    ? {
+                        ...a,
+                        ...(patch.comment !== undefined ? { comment: patch.comment } : {}),
+                        ...(patch.screenshot !== undefined ? { screenshot: patch.screenshot } : {}),
+                        ...(patch.req !== undefined ? { req: { ...a.req, ...patch.req } } : {}),
+                      }
+                    : a,
+                ),
+              );
+            }}
+            onEnviarRequerimientos={onEnviarRequerimientos}
+            onClose={() => setShowChanges(false)}
+            isVisible={showChangesVisible}
+            toolbarNearBottom={!!toolbarPosition && toolbarPosition.y < 230}
+          />
         </div>
       </div>
+      )}
 
       {/* Blank canvas backdrop — stays mounted so opacity transition works on open/close */}
       {(isDesignMode || designOverlayExiting) && (
@@ -4509,12 +4870,14 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
 
                 return (
                   <>
-                    <PendingMarker
-                      x={markerX}
-                      y={markerY}
-                      isMultiSelect={pendingAnnotation.isMultiSelect}
-                      isExiting={pendingExiting}
-                    />
+                    {!recordingActive && (
+                      <PendingMarker
+                        x={markerX}
+                        y={markerY}
+                        isMultiSelect={pendingAnnotation.isMultiSelect}
+                        isExiting={pendingExiting}
+                      />
+                    )}
 
                     <AnnotationPopupCSS
                       ref={popupRef}
@@ -4532,6 +4895,19 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
                       onCancel={cancelAnnotation}
                       isExiting={pendingExiting}
                       lightMode={!isDarkMode}
+                      requerimientoMode={requerimientoMode}
+                      prioridades={prioridades}
+                      responsables={responsables}
+                      screenshot={pendingScreenshot ?? undefined}
+                      pageUrl={
+                        typeof window !== "undefined"
+                          ? window.location.pathname + window.location.search + window.location.hash
+                          : undefined
+                      }
+                      onCreateRequerimiento={onCreateRequerimiento}
+                      onAssistDescripcion={onAssistDescripcion}
+                      anchorX={(markerX / 100) * window.innerWidth}
+                      anchorY={markerY}
                       accentColor={
                         pendingAnnotation.isMultiSelect
                           ? "var(--agentation-color-green)"
