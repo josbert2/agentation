@@ -41,51 +41,42 @@ function scssModulesPlugin(): Plugin {
 
           css = postcssResult.css;
 
-          // Generate JS that exports class names and injects styles (SSR-safe +
-          // hydration-safe). Ver nota en la rama de abajo: la inyección se DIFIERE
-          // fuera del tick de hidratación de React.
+          // Generate JS that exports class names and injects styles (SSR-safe).
+          // Inyección INMEDIATA: el consumidor monta el componente en un root de
+          // React separado y ya post-hidratación, así que mutar <head> acá no
+          // compite con ninguna hidratación (eso era lo que rompía #418 cuando el
+          // componente vivía dentro del árbol hidratado). Síncrono = anda en
+          // cualquier estado de pestaña, sin depender de requestAnimationFrame.
           const contents = `
 const css = ${JSON.stringify(css)};
 const classNames = ${JSON.stringify(classNames)};
 
 if (typeof document !== 'undefined') {
-  var __apply = function () {
-    var style = document.getElementById('feedback-tool-styles-${styleId}');
-    if (!style) {
-      style = document.createElement('style');
-      style.id = 'feedback-tool-styles-${styleId}';
-      document.head.appendChild(style);
-    }
-    style.textContent = css;
-  };
-  // NO mutar <head> mientras React hidrata: en hosts que hidratan el <html>
-  // entero (TanStack Start SSR) un appendChild al <head> durante la hidratación
-  // rompe la hidratación (React #418) en TODO el árbol. Se difiere con doble rAF
-  // (post-commit + post-paint), o setTimeout como fallback.
-  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(function () { requestAnimationFrame(__apply); });
-  else setTimeout(__apply, 0);
+  let style = document.getElementById('feedback-tool-styles-${styleId}');
+  if (!style) {
+    style = document.createElement('style');
+    style.id = 'feedback-tool-styles-${styleId}';
+    document.head.appendChild(style);
+  }
+  style.textContent = css;
 }
 
 export default classNames;
 `;
           return { contents, loader: "js" };
         } else {
-          // Regular SCSS - no CSS modules processing. Inyección diferida igual
-          // que en la rama de arriba (hydration-safe).
+          // Regular SCSS - no CSS modules processing. Inyección inmediata igual
+          // que en la rama de arriba.
           const contents = `
 const css = ${JSON.stringify(css)};
 if (typeof document !== 'undefined') {
-  var __apply = function () {
-    var style = document.getElementById('feedback-tool-styles-${styleId}');
-    if (!style) {
-      style = document.createElement('style');
-      style.id = 'feedback-tool-styles-${styleId}';
-      document.head.appendChild(style);
-    }
-    style.textContent = css;
-  };
-  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(function () { requestAnimationFrame(__apply); });
-  else setTimeout(__apply, 0);
+  let style = document.getElementById('feedback-tool-styles-${styleId}');
+  if (!style) {
+    style = document.createElement('style');
+    style.id = 'feedback-tool-styles-${styleId}';
+    document.head.appendChild(style);
+  }
+  style.textContent = css;
 }
 export default {};
 `;
