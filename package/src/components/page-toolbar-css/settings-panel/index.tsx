@@ -218,6 +218,24 @@ export function SettingsPanel({
                 onSettingsChange({ blockInteractions: e.target.checked })
               }
             />
+            <CheckboxField
+              className={styles.checkboxField}
+              label="Aprobación automática de MCP"
+              checked={settings.autoAprobarMcp}
+              onChange={(e) =>
+                onSettingsChange({ autoAprobarMcp: e.target.checked })
+              }
+              tooltip="Al resolver una anotación con requerimiento enlazado, la aprueba sola (manda Pendiente de confirmación a la API) sin que toques Aprobar."
+            />
+            <CheckboxField
+              className={styles.checkboxField}
+              label="Solo marcar (sin captura)"
+              checked={settings.soloMarcar}
+              onChange={(e) =>
+                onSettingsChange({ soloMarcar: e.target.checked })
+              }
+              tooltip="Como el agentation original: al marcar un elemento no se captura screenshot ni se ofrece marcarla — sólo el cuadro para escribir el feedback y copiar la referencia. Más liviano y rápido."
+            />
           </div>
 
           <div className={styles.divider} />

@@ -99,7 +99,7 @@ export async function captureDomRegion(
     fixed: boolean;
   }>,
   padding = 32,
-  quality = 0.85,
+  quality = 0.92,
 ): Promise<string | null> {
   const mod = await getDomCapture();
   if (!mod) return null;
@@ -110,8 +110,9 @@ export async function captureDomRegion(
   const captureW = regionW + padding * 2;
   const captureH = regionH + padding * 2;
 
-  // Output size (capped)
-  const maxDim = 600;
+  // Output size (capped). Antes 600px = se veía borroso; 1600 da nitidez sin
+  // pesar de más (el JPEG comprime bien las UI planas).
+  const maxDim = 1600;
   const outScale = Math.min(1, maxDim / Math.max(captureW, captureH));
   const outW = Math.round(captureW * outScale);
   const outH = Math.round(captureH * outScale);
@@ -126,9 +127,11 @@ export async function captureDomRegion(
     const target = findCaptureTarget(captureX, captureY, captureW, captureH);
     const targetRect = target.getBoundingClientRect();
 
-    // Render the target element at 1:1 CSS pixel scale
+    // Render a 2x (retina) para que el texto y los bordes queden nítidos: el
+    // downscale posterior a la resolución de salida sale mucho más limpio.
     const domCanvas = await mod.domToCanvas(target, {
       backgroundColor: "#ffffff",
+      scale: 2,
       timeout: 5000,
     });
 
@@ -159,6 +162,9 @@ export async function captureDomRegion(
     canvas.height = outH;
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
+    // Downscale de alta calidad (si no, el 2x → salida se ve escalonado).
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
 
     // White background in case crop extends beyond domCanvas
     ctx.fillStyle = "#ffffff";

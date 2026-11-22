@@ -269,6 +269,11 @@ export function ChangesPanel({
                         )}
                       </div>
                     </button>
+                    {frame.mcpSent && (
+                      <span className={styles.railMcpBadge} title="Enviado al MCP">
+                        ✓ MCP
+                      </span>
+                    )}
                     <button
                       type="button"
                       className={styles.railDelete}

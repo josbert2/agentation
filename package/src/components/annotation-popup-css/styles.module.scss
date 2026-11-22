@@ -64,17 +64,40 @@
 // Popup Container
 // =============================================================================
 
+// Backdrop del form de requerimiento: bloquea clicks a la página de atrás sin
+// oscurecerla (se sigue viendo lo que se está anotando). Debajo del popup.
+.reqBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100006;
+  background: transparent;
+  cursor: default;
+}
+
 .popup {
   position: fixed;
   transform: translateX(-50%);
   width: 280px;
   padding: 0.75rem 1rem 14px;
+}
+/* Modo requerimiento: compacto y minimalista. Más angosto y con menos padding
+   que antes; las chips de prioridad pueden envolver a dos filas sin problema. */
+.reqMode {
+  width: 380px;
+  max-width: calc(100vw - 24px);
+  padding: 0.75rem 0.9rem 0.8rem;
+}
+.popup {
   background: #1a1a1a;
   border-radius: 16px;
   box-shadow:
     0 4px 24px rgba(0, 0, 0, 0.3),
     0 0 0 1px rgba(255, 255, 255, 0.08);
-  z-index: 100001;
+  z-index: 100007;
+  /* Nunca más alto que la pantalla: si el form no entra, scrollea adentro. */
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  overflow-x: hidden;
   font-family:
     system-ui,
     -apple-system,
@@ -115,7 +138,19 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 0.4rem;
   margin-bottom: 0.5625rem;
+}
+
+// Handle de arrastre: puntos que indican que el panel se puede mover.
+.dragGrip {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  color: rgba(255, 255, 255, 0.3);
+  transition: color 0.15s ease;
+
+  .header:hover & { color: rgba(255, 255, 255, 0.55); }
 }
 
 .element {
@@ -319,6 +354,31 @@
   }
 }
 
+// Enviar MCP: acción secundaria (outline morado), más discreta que "Agregar".
+.mcp {
+  padding: 0.4rem 0.75rem;
+  font-size: 0.72rem;
+  font-weight: 500;
+  border-radius: 1rem;
+  border: 1px solid rgba(124, 92, 255, 0.5);
+  background: transparent;
+  color: #b6a4ff;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease,
+    opacity 0.15s ease;
+
+  &:hover:not(:disabled) {
+    background: rgba(124, 92, 255, 0.16);
+    color: #fff;
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+  }
+}
+
 // Delete button wrapper
 .deleteWrapper {
   margin-right: auto;
@@ -351,6 +411,296 @@
 
   &:active {
     transform: scale(0.92);
+  }
+}
+
+// =============================================================================
+// Modo requerimiento (ticket)
+// =============================================================================
+
+.reqThumb {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  margin-bottom: 0.7rem;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  line-height: 0;
+}
+
+.reqThumbImg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top;
+  user-select: none;
+}
+
+/* Botón "Marcar" ENCIMA de la imagen, abajo a la derecha. */
+.reqThumbMark {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 13px;
+  border: none;
+  border-radius: 9px;
+  background: rgba(16, 16, 22, 0.74);
+  backdrop-filter: blur(6px);
+  color: #fff;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+  transition: background-color 0.15s ease, transform 0.12s ease;
+}
+.reqThumbMark:hover {
+  background: #7c5cff;
+  transform: translateY(-1px);
+}
+
+.reqThumbBadge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 2px 7px;
+  font-size: 0.625rem;
+  font-weight: 600;
+  line-height: 1.4;
+  color: #fff;
+  background: #7c5cff;
+  border-radius: 999px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+}
+
+.reqThumbPlaceholder {
+  width: 100%;
+  padding: 1.25rem 0;
+  margin-bottom: 0.5rem;
+  text-align: center;
+  font-size: 0.6875rem;
+  color: rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px dashed rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+}
+
+.reqLabel {
+  display: block;
+  font-size: 10px !important;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.42);
+  margin: 0.9rem 0 0.45rem;
+}
+
+// Fila del label de Descripción + botón de IA a la derecha.
+.reqLabelRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: 0.9rem;
+
+  .reqLabel { margin: 0 0 0.45rem; }
+}
+
+.reqAiButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  font-family: inherit;
+  color: #c9b8ff;
+  background: rgba(124, 92, 255, 0.14);
+  border: 1px solid rgba(124, 92, 255, 0.4);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background-color 0.15s ease, opacity 0.15s ease;
+
+  &:hover:not(:disabled) { background: rgba(124, 92, 255, 0.24); }
+  &:disabled { opacity: 0.6; cursor: default; }
+
+  svg { flex-shrink: 0; }
+}
+
+.reqAiSpin {
+  animation: reqAiSpin 0.8s linear infinite;
+}
+@keyframes reqAiSpin {
+  to { transform: rotate(360deg); }
+}
+
+.reqAiError {
+  display: block;
+  font-size: 0.6875rem;
+  color: #ff6b6b;
+  margin-bottom: 0.25rem;
+}
+
+.reqInput {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 0.45rem 0.625rem;
+  font-size: 0.8125rem;
+  font-family: inherit;
+  background: rgba(255, 255, 255, 0.05);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+  outline: none;
+  transition: border-color 0.15s ease;
+
+  &:focus {
+    border-color: #7c5cff;
+  }
+
+  &::placeholder {
+    color: rgba(255, 255, 255, 0.35);
+  }
+}
+
+.reqChips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.reqChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.7rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.75);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 1rem;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.12);
+  }
+}
+
+.reqChipActive {
+  color: #fff;
+
+  &:hover {
+    filter: brightness(0.95);
+  }
+}
+
+.reqChipDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.reqMarcarBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+  padding: 0.35rem 0.75rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.75);
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 1rem;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease,
+    background-color 0.15s ease;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+}
+
+.reqMarcarBtnActive {
+  background: color-mix(in srgb, #7c5cff 15%, transparent);
+}
+
+.reqError {
+  margin-top: 0.5rem;
+  font-size: 0.6875rem;
+  color: #ff6b6b;
+}
+
+.reqFooter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: 0.625rem;
+}
+
+.reqLink {
+  font-size: 0.6875rem;
+  color: rgba(255, 255, 255, 0.4);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 45%;
+
+  &:hover {
+    color: rgba(255, 255, 255, 0.6);
+  }
+}
+
+.reqFooterActions {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  margin-left: auto;
+}
+
+/* Celular: cuatro botones no entran en una fila de 380 px y «Agregar» se salía
+   de la ficha. Pasan a una grilla de 2 × 2 (Cancelar · Copiar / Enviar MCP ·
+   Agregar), con altura de dedo, y el link de la página va en su propia línea. */
+@media (max-width: 520px) {
+  .reqFooter {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.625rem;
+  }
+
+  .reqLink {
+    max-width: 100%;
+  }
+
+  .reqFooterActions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.5rem;
+    margin-left: 0;
+    width: 100%;
+
+    > button {
+      min-height: 44px;
+      width: 100%;
+      justify-content: center;
+      white-space: nowrap;
+    }
   }
 }
 
@@ -434,4 +784,240 @@
       color: var(--agentation-color-red);
     }
   }
+
+  // Modo requerimiento
+  .reqThumb {
+    border-color: rgba(0, 0, 0, 0.1);
+    background: rgba(0, 0, 0, 0.03);
+  }
+
+  .reqThumbPlaceholder {
+    color: rgba(0, 0, 0, 0.4);
+    background: rgba(0, 0, 0, 0.03);
+    border-color: rgba(0, 0, 0, 0.12);
+  }
+
+  .reqLabel {
+    color: rgba(0, 0, 0, 0.55);
+  }
+
+  .reqInput {
+    background: rgba(0, 0, 0, 0.03);
+    color: #1a1a1a;
+    border-color: rgba(0, 0, 0, 0.12);
+
+    &::placeholder {
+      color: rgba(0, 0, 0, 0.4);
+    }
+  }
+
+  .reqChip {
+    color: rgba(0, 0, 0, 0.7);
+    background: rgba(0, 0, 0, 0.04);
+    border-color: rgba(0, 0, 0, 0.12);
+
+    &:hover {
+      background: rgba(0, 0, 0, 0.08);
+    }
+  }
+
+  .reqChipActive {
+    color: #fff;
+  }
+
+  .reqMarcarBtn {
+    color: rgba(0, 0, 0, 0.7);
+    border-color: rgba(0, 0, 0, 0.2);
+
+    &:hover {
+      background: rgba(0, 0, 0, 0.05);
+    }
+  }
+
+  .reqLink {
+    color: rgba(0, 0, 0, 0.4);
+
+    &:hover {
+      color: rgba(0, 0, 0, 0.6);
+    }
+  }
+}
+
+// =============================================================================
+// Grabación de pantalla (video del bug)
+// =============================================================================
+
+// Fila del botón "Grabar pantalla" / preview del video, bajo la captura.
+.reqRecRow {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  margin-top: 0.55rem;
+}
+
+.reqRecBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  width: 100%;
+  padding: 0.55rem 0.7rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  font-family: inherit;
+  color: #ff6b6b;
+  background: rgba(224, 50, 47, 0.1);
+  border: 1px solid rgba(224, 50, 47, 0.35);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+
+  &:hover { background: rgba(224, 50, 47, 0.18); }
+  svg { flex-shrink: 0; }
+}
+
+.reqRecPreview {
+  width: 100%;
+  border-radius: 8px;
+  background: #000;
+  max-height: 180px;
+}
+
+.reqRecReadyActions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.reqRecReady {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #34d399;
+  svg { flex-shrink: 0; }
+}
+
+.reqRecGhost {
+  padding: 0.25rem 0.55rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  font-family: inherit;
+  color: rgba(255, 255, 255, 0.7);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+  cursor: pointer;
+  &:hover { background: rgba(255, 255, 255, 0.12); }
+}
+
+// Control flotante mientras se graba: todo lo demás (popup + backdrop) está
+// oculto para que no salga en el video. Va chico y en una esquina, semi-
+// transparente hasta el hover, para estorbar lo mínimo en la grabación.
+.recBar {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  left: auto;
+  transform: none;
+  z-index: 100002;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.5rem 0.35rem 0.7rem;
+  background: rgba(20, 20, 24, 0.72);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+  font-family: system-ui, -apple-system, sans-serif;
+  opacity: 0.55;
+  transition: opacity 0.15s ease;
+
+  &:hover { opacity: 1; }
+}
+
+.recDot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #ff3b30;
+  animation: recPulse 1s ease-in-out infinite;
+}
+@keyframes recPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.recTime {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #fff;
+  font-variant-numeric: tabular-nums;
+}
+
+.recStop {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.7rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  font-family: inherit;
+  color: #fff;
+  background: #ff3b30;
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  &:hover { background: #e0322f; }
+}
+.recStopSq {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: #fff;
+}
+
+// =============================================================================
+// Línea conectora tipo n8n (panel ←→ punto/marcador)
+// =============================================================================
+.connector {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  pointer-events: none;
+  overflow: visible;
+  z-index: 100006; // sobre el backdrop, bajo el popup (100007)
+}
+
+.connectorFlow {
+  fill: none;
+  stroke: #7c5cff;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-dasharray: 6 7;
+  filter: drop-shadow(0 0 3px rgba(124, 92, 255, 0.55));
+  animation: connectorFlow 0.7s linear infinite;
+}
+@keyframes connectorFlow {
+  to { stroke-dashoffset: -13; }
+}
+
+.connectorNode {
+  fill: #7c5cff;
+}
+
+.connectorPulse {
+  fill: #7c5cff;
+  opacity: 0.25;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: connectorPulse 1.4s ease-in-out infinite;
+}
+@keyframes connectorPulse {
+  0%, 100% { opacity: 0.28; transform: scale(1); }
+  50%      { opacity: 0.08; transform: scale(1.6); }
 }

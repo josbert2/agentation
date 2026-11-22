@@ -102,6 +102,38 @@ export const IconListSparkle = ({
   </svg>
 );
 
+// Clipboard with checkmark — botón "Requerimientos" del toolbar
+export const IconClipboardCheck = ({
+  size = 24,
+  style = {},
+}: {
+  size?: number;
+  style?: React.CSSProperties;
+}) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" style={style}>
+    <path
+      d="M9 4.75H7.5C6.4 4.75 5.5 5.65 5.5 6.75V17.75C5.5 18.85 6.4 19.75 7.5 19.75H16.5C17.6 19.75 18.5 18.85 18.5 17.75V6.75C18.5 5.65 17.6 4.75 16.5 4.75H15"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <path
+      d="M9 4.75C9 3.92 9.67 3.25 10.5 3.25H13.5C14.33 3.25 15 3.92 15 4.75C15 5.58 14.33 6.25 13.5 6.25H10.5C9.67 6.25 9 5.58 9 4.75Z"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinejoin="round"
+    />
+    <path
+      d="M9 13L11 15L15 11"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
+
 // Help/Question mark icon for tooltips
 export const IconHelp = ({
   size = 20,
@@ -1038,6 +1070,34 @@ export const AnimatedBunny = ({
     >
       ˃ ᵕ ˂
     </text>
+  </svg>
+);
+
+// Frames / gallery icon for the changes panel (stacked layers)
+export const IconFrames = ({ size = 24 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+    <rect
+      x="4"
+      y="7.5"
+      width="16"
+      height="12"
+      rx="2"
+      stroke="currentColor"
+      strokeWidth="1.5"
+    />
+    <path
+      d="M4 12.5L8.5 9.75L12 12.5L15.5 10.25L20 13.25"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <path
+      d="M7 4.75H17"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+    />
   </svg>
 );
 

@@ -65,10 +65,23 @@ export async function syncAnnotation(
   sessionId: string,
   annotation: Annotation
 ): Promise<Annotation> {
+  // El resumen del MCP (get_all_pending) solo muestra `comment`, no `sourceFile`
+  // ni `screenshotUrl`. Para que el agente igual reciba el archivo:línea del
+  // código y el link de la captura, se los adjuntamos AL COMENTARIO en la copia
+  // que va al server. El comentario que ve la persona en pantalla no se toca:
+  // esto es solo el objeto que se postea.
+  const extras: string[] = [];
+  if (annotation.sourceFile) extras.push(`📁 ${annotation.sourceFile}`);
+  if (annotation.screenshotUrl) extras.push(`🖼 ${annotation.screenshotUrl}`);
+  const paraServer: Annotation =
+    extras.length > 0
+      ? { ...annotation, comment: `${annotation.comment}\n\n${extras.join("\n")}` }
+      : annotation;
+
   const response = await fetch(`${endpoint}/sessions/${sessionId}/annotations`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(annotation),
+    body: JSON.stringify(paraServer),
   });
 
   if (!response.ok) {

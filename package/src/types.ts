@@ -13,6 +13,10 @@ export type Annotation = {
   selectedText?: string;
   boundingBox?: { x: number; y: number; width: number; height: number };
   nearbyText?: string;
+  screenshot?: string; // Data URL of a captured screenshot of the annotated region
+  screenshotUrl?: string; // Public URL of the uploaded screenshot (e.g. S3), for copy references
+  video?: string; // Data URL (video/webm) of a screen recording of the bug/interaction
+  videoSeconds?: number; // Duration of the recording, for the UI label
   cssClasses?: string;
   nearbyElements?: string;
   computedStyles?: string;
@@ -29,6 +33,15 @@ export type Annotation = {
     width: number;
     height: number;
   }>; // Individual bounding boxes for multi-select hover highlighting
+
+  // Datos del requerimiento por frame (modo requerimiento). Se llenan al
+  // "Agregar" desde el popup y se editan en el Panel de Cambios; el envío en
+  // lote ("Enviar N") los usa para crear cada requerimiento.
+  req?: { titulo?: string; prioridad?: string; responsable?: string | null };
+
+  // true si la anotación se mandó al MCP con el botón "Enviar MCP" (para pintar
+  // el badge de "enviado" en el frame del Panel de Cambios).
+  mcpSent?: boolean;
 
   // Annotation kind (defaults to "feedback" when undefined — backward compat)
   kind?: "feedback" | "placement" | "rearrange";
@@ -66,6 +79,9 @@ export type Annotation = {
 
   // Local-only sync tracking (not sent to server)
   _syncedTo?: string; // Session ID this annotation was synced to
+  /** El humano aprobó el arreglo tras probarlo (paso posterior a que el agente
+   *  la marque resuelta). Local, no viaja al server. */
+  aprobada?: boolean;
 };
 
 // -----------------------------------------------------------------------------

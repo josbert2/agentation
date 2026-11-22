@@ -123,6 +123,13 @@ export function generateOutput(
       }
       output += `**Feedback:** ${a.comment}\n\n`;
     }
+    // Referencia a la captura subida (S3), si hay. El agente la puede abrir.
+    if (a.screenshotUrl) {
+      output +=
+        detailLevel === "compact"
+          ? `   Captura: ${a.screenshotUrl}\n`
+          : `**Captura:** ${a.screenshotUrl}\n\n`;
+    }
   });
 
   return output.trim();

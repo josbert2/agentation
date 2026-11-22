@@ -21,6 +21,8 @@ import {
   IconChevronRight,
   IconLayout,
   IconFrames,
+  IconChatEllipsis,
+  IconClipboardCheck,
 } from "../icons";
 import { HelpTooltip } from "../help-tooltip";
 import { DesignMode } from "../design-mode";
@@ -156,6 +158,13 @@ export type ToolbarSettings = {
   markerClickBehavior: MarkerClickBehavior;
   webhookUrl: string;
   webhooksEnabled: boolean;
+  /** Al resolver una anotación con `🔗 Requerimiento #N`, aprobar sola: mandar
+   *  `por_confirmar` a la API sin que el humano toque "Aprobar". */
+  autoAprobarMcp: boolean;
+  /** Modo "solo marcar" (como el agentation original): al marcar un elemento NO
+   *  se captura screenshot ni se ofrece marcar la captura — sólo el cuadro para
+   *  escribir el feedback y copiar la referencia. Liviano y rápido. */
+  soloMarcar: boolean;
 };
 
 const DEFAULT_SETTINGS: ToolbarSettings = {
@@ -167,6 +176,8 @@ const DEFAULT_SETTINGS: ToolbarSettings = {
   markerClickBehavior: "edit",
   webhookUrl: "",
   webhooksEnabled: true,
+  autoAprobarMcp: false,
+  soloMarcar: false,
 };
 
 // Simple URL validation - checks for valid http(s) URL format
@@ -373,6 +384,33 @@ export type PageFeedbackToolbarCSSProps = {
     seleccion: string;
     prioridad: string;
   }) => Promise<string | null>;
+  /** URL absoluta que devuelve `{ items: RequerimientoLite[] }` para el botón
+   *  "Requerimientos" del toolbar (la bandeja de /admin/requerimientos). Si no
+   *  se pasa, el botón no aparece. */
+  requerimientosUrl?: string;
+  /** Headers (ej. Authorization) para el fetch de `requerimientosUrl`. */
+  requerimientosHeaders?: Record<string, string>;
+  /** Abre una ficha desde el panel de Requerimientos (navega en la app host). */
+  onOpenRequerimiento?: (id: number) => void;
+  /** Cambia el estado de una ficha desde el panel. Devuelve true si salió bien. */
+  onUpdateRequerimientoStatus?: (id: number, status: string) => Promise<boolean>;
+};
+
+/** Lo mínimo que el panel de Requerimientos del toolbar necesita de cada ficha. */
+export type RequerimientoLite = {
+  id: number;
+  title: string | null;
+  problem: string;
+  status: string;
+  priority: string;
+  page_url: string | null;
+  source?: string;
+  responsable?: string | null;
+  reported_by?: string | null;
+  has_screenshot?: boolean;
+  reopened_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
 };
 
 /** Alias for PageFeedbackToolbarCSSProps */
@@ -381,6 +419,13 @@ export type AgentationProps = PageFeedbackToolbarCSSProps;
 // =============================================================================
 // Component
 // =============================================================================
+
+/**
+ * Elementos que el marcado NUNCA debe resaltar ni seleccionar: la barra propia
+ * de agentation y la píldora/triggers de "Anotar / Reportar requerimiento". Sin
+ * esto, al marcar se resaltaba la propia UI (el botón de la píldora).
+ */
+const SEL_IGNORAR = "[data-feedback-toolbar], [data-agentation-root], [data-req-ignore], [data-agentation-trigger]";
 
 export function PageFeedbackToolbarCSS({
   demoAnnotations,
@@ -405,6 +450,10 @@ export function PageFeedbackToolbarCSS({
   onCreateRequerimiento,
   onEnviarRequerimientos,
   onAssistDescripcion,
+  requerimientosUrl,
+  requerimientosHeaders,
+  onOpenRequerimiento,
+  onUpdateRequerimientoStatus,
   className: userClassName,
   externalTrigger = false,
 }: PageFeedbackToolbarCSSProps = {}) {
@@ -473,9 +522,21 @@ export function PageFeedbackToolbarCSS({
   // fase de captura a nivel window (antes que cualquier listener de la app), y
   // únicamente cuando NO nace de la propia UI de agentation. El anotar sigue
   // andando; el drawer queda abierto para poder capturarlo.
+  // Con un panel abierto (Requerimientos / Estado / Settings / Cambios) NO estás
+  // anotando: estás navegando, así que no hay que frenar el pointerdown —si no,
+  // se rompe el drag&drop de la app (dnd-kit arranca con pointerdown) y no podés
+  // mover, por ejemplo, tarjetas del tablero. Vive en un ref porque los states
+  // de los paneles se declaran más abajo (evita el TDZ acá arriba).
+  const panelAbiertoRef = useRef(false);
+  // Toggle "Aprobación automática de MCP", leído desde el handler del SSE.
+  const autoAprobarRef = useRef(false);
+  // Toggle "Solo marcar" (sin captura), leído desde el callback estable de crear
+  // anotación —cuyas deps no incluyen `settings`, así evitamos el closure viejo.
+  const soloMarcarRef = useRef(false);
   useEffect(() => {
     if (!isActive) return;
     const bloquearDismiss = (e: PointerEvent) => {
+      if (panelAbiertoRef.current) return; // navegando un panel: dejar pasar
       const t = e.target as Element | null;
       if (t && t.closest("[data-agentation-root]")) return; // UI propia: dejar pasar
       e.stopImmediatePropagation();
@@ -552,6 +613,119 @@ export function PageFeedbackToolbarCSS({
   const [showSettingsVisible, setShowSettingsVisible] = useState(false);
   const [showChanges, setShowChanges] = useState(false);
   const [showChangesVisible, setShowChangesVisible] = useState(false);
+  // Popover "Estado": lista las anotaciones y en qué estado están (pendiente /
+  // enviada al MCP / resuelta).
+  const [showEstado, setShowEstado] = useState(false);
+  // Tab del popover Estado: "pendientes" (sin resolver) vs "hechos" (marcadas
+  // resueltas por el agente, a la espera de tu aprobación / ya aprobadas).
+  const [estadoTab, setEstadoTab] = useState<"pendientes" | "hechos">("pendientes");
+  // Filas del popover Estado que el usuario expandió con "Ver completa" — el
+  // texto viene truncado a una línea por defecto porque el panel es angosto.
+  const [estadoExpandido, setEstadoExpandido] = useState<Set<string>>(new Set());
+  // Popover "Requerimientos": la bandeja real de /admin/requerimientos, traída
+  // por fetch a `requerimientosUrl` con el token del host. Datos + estados del
+  // backend, no las anotaciones locales.
+  const [showReqs, setShowReqs] = useState(false);
+  const [reqs, setReqs] = useState<RequerimientoLite[]>([]);
+  const [reqsLoading, setReqsLoading] = useState(false);
+  const [reqsError, setReqsError] = useState(false);
+  // "vivos" = abierto+en_progreso · "" = todos · o un status puntual.
+  const [reqsEstado, setReqsEstado] = useState<string>("vivos");
+  // "" = todas las personas · o el nombre del responsable.
+  const [reqsPersona, setReqsPersona] = useState<string>("");
+  // Ficha abierta en el detalle deslizante (dentro del panel). null = lista.
+  const [reqDetalleId, setReqDetalleId] = useState<number | null>(null);
+  // Entrada del panel de Requerimientos (card flotante arriba de los íconos del
+  // toolbar). Arranca en false al montar y pasa a true en el frame siguiente,
+  // así hace un pop suave (fade + slide-up desde bottom-right). false al cerrar.
+  const [reqDrawerIn, setReqDrawerIn] = useState(false);
+  // "Enviar MCP" del detalle de un requerimiento: id en vuelo / el que falló
+  // último. Sin esto, un envío que fallaba (server caído) no se distinguía en
+  // pantalla de uno que sí llegó — el botón simplemente no decía nada.
+  const [reqMcpEnviando, setReqMcpEnviando] = useState<number | null>(null);
+  const [reqMcpError, setReqMcpError] = useState<number | null>(null);
+  // Grupos de estado colapsados en la lista (acordeón). key = status.
+  const [reqColapsados, setReqColapsados] = useState<Record<string, boolean>>({});
+  // Requerimiento a enlazar con la PRÓXIMA anotación: cuando desde el detalle se
+  // toca "Marcar en pantalla", se guarda el id acá; la próxima anotación que se
+  // cree le mete "🔗 Requerimiento #N" al comentario (así viaja al MCP y Claude
+  // sabe qué ficha cerrar al resolver el pendiente). Se limpia al usarse.
+  const reqVinculoRef = useRef<{ id: number; titulo: string; descripcion: string } | null>(null);
+  // Mantiene fresco el ref que usan los listeners de marcado (bloquearDismiss,
+  // hover, click): con un panel abierto estás navegando, no anotando.
+  panelAbiertoRef.current = showReqs || showEstado || showSettings || showChanges;
+
+  // Historial persistente de lo HECHO (resuelto/aprobado). El sync del server
+  // trae SOLO pendientes, así que sin esto lo resuelto desaparecía del tab
+  // "Hechos" al reconectar/recargar. Vive en localStorage (global, todas las
+  // pantallas) y captura toda anotación que pase por `resolvedAt`.
+  const HIST_KEY = "agentation-historial";
+  const [historial, setHistorial] = useState<Record<string, Annotation>>(() => {
+    try { return JSON.parse(localStorage.getItem(HIST_KEY) || "{}"); } catch { return {}; }
+  });
+  const persistirHistorial = useCallback((next: Record<string, Annotation>) => {
+    try { localStorage.setItem(HIST_KEY, JSON.stringify(next)); } catch { /* sin storage */ }
+  }, []);
+  // Captura al historial toda anotación resuelta que aparezca en el estado local.
+  // OJO: NADA de JSON.stringify de la anotación entera —el `screenshot` es un
+  // data-URL base64 enorme y stringificarlo en cada cambio congela el hilo. Se
+  // guarda liviano (sin el base64) y se compara por los campos que importan.
+  useEffect(() => {
+    const resueltas = annotations.filter((a) => a.resolvedAt);
+    if (resueltas.length === 0) return;
+    setHistorial((prev) => {
+      let cambio = false;
+      const next = { ...prev };
+      for (const a of resueltas) {
+        const ya = next[a.id];
+        const aprobada = a.aprobada || ya?.aprobada;
+        if (ya && ya.resolvedAt === a.resolvedAt && ya.aprobada === aprobada) continue;
+        // Liviano: sin `screenshot` (base64) para no pesar ni reventar el storage.
+        const { screenshot: _omit, ...liviano } = a;
+        next[a.id] = { ...liviano, aprobada } as Annotation;
+        cambio = true;
+      }
+      if (!cambio) return prev;
+      persistirHistorial(next);
+      return next;
+    });
+  }, [annotations, persistirHistorial]);
+  const cargarReqs = useCallback(() => {
+    if (!requerimientosUrl) return;
+    setReqsLoading(true);
+    setReqsError(false);
+    fetch(requerimientosUrl, { headers: requerimientosHeaders })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+      .then((d: { items?: RequerimientoLite[] }) => setReqs(d.items ?? []))
+      .catch(() => setReqsError(true))
+      .finally(() => setReqsLoading(false));
+  }, [requerimientosUrl, requerimientosHeaders]);
+
+  // Pop del panel de Requerimientos: en cuanto showReqs pasa a true, dejamos que
+  // pinte oculto y al frame siguiente lo mostramos (fade + slide-up).
+  useEffect(() => {
+    if (!showReqs) { setReqDrawerIn(false); return; }
+    const raf = requestAnimationFrame(() => setReqDrawerIn(true));
+    return () => cancelAnimationFrame(raf);
+  }, [showReqs]);
+
+  // Al abrir la URL de una ficha (link del panel) llega `?agReq=N`: reabrimos el
+  // toolbar + el panel de Requerimientos con esa ficha en el detalle, así seguís
+  // el requerimiento en la pantalla donde se reportó. Limpiamos el param.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const p = new URLSearchParams(window.location.search).get("agReq");
+    const id = p ? Number(p) : NaN;
+    if (!Number.isInteger(id) || id <= 0) return;
+    setIsActive(true);
+    setShowReqs(true);
+    setReqDetalleId(id);
+    cargarReqs();
+    const u = new URL(window.location.href);
+    u.searchParams.delete("agReq");
+    window.history.replaceState({}, "", u.toString());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [settingsPage, setSettingsPage] = useState<"main" | "automations">(
     "main",
   );
@@ -685,6 +859,8 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
     return DEFAULT_SETTINGS;
   }
 });
+  autoAprobarRef.current = settings.autoAprobarMcp;
+  soloMarcarRef.current = settings.soloMarcar;
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [showEntranceAnimation, setShowEntranceAnimation] = useState(false);
 
@@ -1151,10 +1327,42 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
               }
             }
           } else {
-            // Feedback annotation — trigger exit animation then remove
+            // Feedback annotation. Antes se borraba y punto —por eso lo RESUELTO
+            // nunca llegaba al tab "Hechos". Ahora: si el estado es `resolved`, se
+            // captura al historial (liviano, sin el screenshot base64) ANTES de
+            // sacarla de pendientes. `dismissed` sí se descarta sin dejar rastro.
+            const esResuelta = event.payload?.status === "resolved";
             setExitingMarkers((prev) => new Set(prev).add(id));
             originalSetTimeout(() => {
-              setAnnotations((prev) => prev.filter((a) => a.id !== id));
+              setAnnotations((prev) => {
+                if (esResuelta) {
+                  const a = prev.find((x) => x.id === id);
+                  if (a) {
+                    const { screenshot: _omit, ...liviano } = a;
+                    const item = {
+                      ...liviano,
+                      resolvedAt: a.resolvedAt || new Date().toISOString(),
+                    } as Annotation;
+                    // Aprobación automática: si está el toggle y la anotación
+                    // apunta a un requerimiento, se aprueba sola (por_confirmar).
+                    const reqMatch = (a.comment || "").match(/Requerimiento #(\d+)/);
+                    const autoAprobar =
+                      autoAprobarRef.current && !!reqMatch && !!onUpdateRequerimientoStatus;
+                    if (autoAprobar && reqMatch) {
+                      onUpdateRequerimientoStatus?.(Number(reqMatch[1]), "por_confirmar");
+                    }
+                    setHistorial((h) => {
+                      const next = {
+                        ...h,
+                        [id]: { ...item, aprobada: autoAprobar || h[id]?.aprobada },
+                      };
+                      persistirHistorial(next);
+                      return next;
+                    });
+                  }
+                }
+                return prev.filter((x) => x.id !== id);
+              });
               setExitingMarkers((prev) => {
                 const next = new Set(prev);
                 next.delete(id);
@@ -1976,9 +2184,10 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
     if (!isActive || pendingAnnotation || isDrawMode || isDesignMode) return;
 
     const handleMouseMove = (e: MouseEvent) => {
+      if (panelAbiertoRef.current) { setHoverInfo(null); return; } // navegando un panel
       // Use composedPath to get actual target inside shadow DOM
       const target = (e.composedPath()[0] || e.target) as HTMLElement;
-      if (closestCrossingShadow(target, "[data-feedback-toolbar]")) {
+      if (closestCrossingShadow(target, SEL_IGNORAR)) {
         setHoverInfo(null);
         return;
       }
@@ -1986,7 +2195,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
       const elementUnder = deepElementFromPoint(e.clientX, e.clientY);
       if (
         !elementUnder ||
-        closestCrossingShadow(elementUnder, "[data-feedback-toolbar]")
+        closestCrossingShadow(elementUnder, SEL_IGNORAR)
       ) {
         setHoverInfo(null);
         return;
@@ -2064,6 +2273,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
     if (!isActive || isDrawMode || isDesignMode) return;
 
     const handleClick = (e: MouseEvent) => {
+      if (panelAbiertoRef.current) return; // navegando un panel: no colocar anotación
       if (justFinishedDragRef.current) {
         justFinishedDragRef.current = false;
         return;
@@ -2072,7 +2282,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
       // Use composedPath to get actual target inside shadow DOM, falling back to e.target
       const target = (e.composedPath()[0] || e.target) as HTMLElement;
 
-      if (closestCrossingShadow(target, "[data-feedback-toolbar]")) return;
+      if (closestCrossingShadow(target, SEL_IGNORAR)) return;
       if (closestCrossingShadow(target, "[data-annotation-popup]")) return;
       if (closestCrossingShadow(target, "[data-annotation-marker]")) return;
 
@@ -2263,10 +2473,11 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
     if (!isActive || pendingAnnotation || isDrawMode || isDesignMode) return;
 
     const handleMouseDown = (e: MouseEvent) => {
+      if (panelAbiertoRef.current) return; // navegando un panel: no marcar
       // Use composedPath to get actual target inside shadow DOM
       const target = (e.composedPath()[0] || e.target) as HTMLElement;
 
-      if (closestCrossingShadow(target, "[data-feedback-toolbar]")) return;
+      if (closestCrossingShadow(target, SEL_IGNORAR)) return;
       if (closestCrossingShadow(target, "[data-annotation-marker]")) return;
       if (closestCrossingShadow(target, "[data-annotation-popup]")) return;
 
@@ -2447,7 +2658,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
 
         for (const el of candidateElements) {
           if (
-            closestCrossingShadow(el, "[data-feedback-toolbar]") ||
+            closestCrossingShadow(el, SEL_IGNORAR) ||
             closestCrossingShadow(el, "[data-annotation-marker]")
           )
             continue;
@@ -2559,7 +2770,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
         document.querySelectorAll(selector).forEach((el) => {
           if (!(el instanceof HTMLElement)) return;
           if (
-            closestCrossingShadow(el, "[data-feedback-toolbar]") ||
+            closestCrossingShadow(el, SEL_IGNORAR) ||
             closestCrossingShadow(el, "[data-annotation-marker]")
           )
             return;
@@ -2732,15 +2943,25 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
         video?: string;
         videoSeconds?: number;
         req?: { titulo?: string; prioridad?: string; responsable?: string | null };
+        mcp?: boolean;
       },
     ) => {
       if (!pendingAnnotation) return;
+
+      // Si vino desde "Marcar en pantalla" de un requerimiento, enlazamos: el
+      // comentario arranca con la referencia a la ficha (viaja al MCP) para que
+      // Claude cierre ese requerimiento al resolver el pendiente. Se limpia acá.
+      const vinculoReq = reqVinculoRef.current;
+      reqVinculoRef.current = null;
+      const comentarioFinal = vinculoReq
+        ? `🔗 Requerimiento #${vinculoReq.id} — al resolver este pendiente, marcá el requerimiento como resuelto.\n\n${comment}`
+        : comment;
 
       const newAnnotation: Annotation = {
         id: Date.now().toString(),
         x: pendingAnnotation.x,
         y: pendingAnnotation.y,
-        comment,
+        comment: comentarioFinal,
         element: pendingAnnotation.element,
         elementPath: pendingAnnotation.elementPath,
         timestamp: Date.now(),
@@ -2762,6 +2983,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
         ...(extra?.screenshot ? { screenshot: extra.screenshot } : {}),
         ...(extra?.video ? { video: extra.video, videoSeconds: extra.videoSeconds } : {}),
         ...(extra?.req ? { req: extra.req } : {}),
+        ...(extra?.mcp ? { mcpSent: true } : {}),
         // Protocol fields for server sync
         ...(endpoint && currentSessionId
           ? {
@@ -2776,6 +2998,31 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
       };
 
       setAnnotations((prev) => [...prev, newAnnotation]);
+
+      // Sync al server del MCP (con re-mapeo del id que asigna el server). Se
+      // llama con la anotación que corresponda: si hay captura, DESPUÉS de subirla
+      // a S3 y con su `screenshotUrl` puesta, así el agente recibe también la
+      // imagen. Sin captura, se llama al toque (más abajo).
+      const sincronizarAlMcp = (anot: Annotation) => {
+        if (!endpoint || !currentSessionId) return;
+        syncAnnotation(endpoint, currentSessionId, anot)
+          .then((serverAnnotation) => {
+            if (serverAnnotation.id !== anot.id) {
+              setAnnotations((prev) =>
+                prev.map((a) => (a.id === anot.id ? { ...a, id: serverAnnotation.id } : a)),
+              );
+              setAnimatedMarkers((prev) => {
+                const next = new Set(prev);
+                next.delete(anot.id);
+                next.add(serverAnnotation.id);
+                return next;
+              });
+            }
+          })
+          .catch((error) => {
+            console.warn("[Agentation] Failed to sync annotation:", error);
+          });
+      };
 
       // Modo requerimiento: la captura MARCADA ya viene en extra.screenshot. La
       // subimos a S3 acá (al Agregar) para tener la URL pública lista antes de
@@ -2793,15 +3040,21 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
           .then((r) => (r.ok ? r.json() : null))
           .then((res) => {
             const url = res && typeof res.url === "string" ? res.url : null;
-            if (!url) return;
-            setAnnotations((prev) =>
-              prev.map((a) =>
-                a.id === newAnnotation.id ? { ...a, screenshotUrl: url } : a,
-              ),
-            );
+            if (url) {
+              setAnnotations((prev) =>
+                prev.map((a) =>
+                  a.id === newAnnotation.id ? { ...a, screenshotUrl: url } : a,
+                ),
+              );
+            }
+            // Recién ACÁ, con la URL de la captura ya subida, sincronizamos al
+            // MCP — así el agente recibe también la imagen (antes el sync salía
+            // sin esperar la subida y llegaba sin foto).
+            sincronizarAlMcp({ ...newAnnotation, ...(url ? { screenshotUrl: url } : {}) });
           })
           .catch(() => {
-            /* sin URL: el copy va igual, sólo sin la línea de imagen */
+            /* la subida falló: sincronizamos igual, aunque sea sin la imagen */
+            sincronizarAlMcp(newAnnotation);
           });
       }
 
@@ -2810,8 +3063,9 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
       // capture resolves we attach it to the annotation by id (which also
       // persists it to storage via the save effect). captureDomRegion hides
       // the agentation UI while capturing, so markers/popup don't appear.
+      // En "solo marcar" no se captura nada: sólo la marca + el cuadro de texto.
       const captureBox = newAnnotation.boundingBox;
-      if (captureBox && !extra?.screenshot) {
+      if (captureBox && !extra?.screenshot && !soloMarcarRef.current) {
         const regionY = newAnnotation.isFixed
           ? captureBox.y
           : captureBox.y - window.scrollY;
@@ -2884,31 +3138,11 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
 
       window.getSelection()?.removeAllRanges();
 
-      // Sync to server (non-blocking, but update local ID with server's ID)
-      if (endpoint && currentSessionId) {
-        syncAnnotation(endpoint, currentSessionId, newAnnotation)
-          .then((serverAnnotation) => {
-            // Update local annotation with server-assigned ID
-            if (serverAnnotation.id !== newAnnotation.id) {
-              setAnnotations((prev) =>
-                prev.map((a) =>
-                  a.id === newAnnotation.id
-                    ? { ...a, id: serverAnnotation.id }
-                    : a,
-                ),
-              );
-              // Also update the animated markers set
-              setAnimatedMarkers((prev) => {
-                const next = new Set(prev);
-                next.delete(newAnnotation.id);
-                next.add(serverAnnotation.id);
-                return next;
-              });
-            }
-          })
-          .catch((error) => {
-            console.warn("[Agentation] Failed to sync annotation:", error);
-          });
+      // Sync al MCP. Si hubo captura marcada (extra.screenshot), ya se sincroniza
+      // DENTRO del `.then` de la subida a S3 —con la screenshotUrl puesta—, así
+      // que acá solo se sincroniza el resto (sin captura), para no duplicar.
+      if (!(extra?.screenshot && screenshotUploadUrl)) {
+        sincronizarAlMcp(newAnnotation);
       }
     },
     [
@@ -2918,6 +3152,56 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
       endpoint,
       currentSessionId,
     ],
+  );
+
+  // Manda un requerimiento YA REPORTADO (bandeja de prod) directo al MCP, sin
+  // marcar nada en pantalla — para el que ya está descrito y solo hace falta
+  // que el agente lo levante, en vez de tener que "Marcar" un elemento que a
+  // veces ni existe en esta pantalla (una reunión, un cron, algo de otro rol).
+  const enviarRequerimientoAlMcp = useCallback(
+    (r: RequerimientoLite) => {
+      const cuerpo = r.title && r.title !== r.problem ? `${r.title}\n\n${r.problem}` : r.problem;
+      const nueva: Annotation = {
+        id: `req-${r.id}-${Date.now()}`,
+        x: 50,
+        y: 0,
+        comment: `🔗 Requerimiento #${r.id} — al resolver este pendiente, marcá el requerimiento como resuelto.\n\n${cuerpo}`,
+        element: "Requerimiento",
+        // No vacío: el server de MCP trata "" como si faltara el campo y
+        // devuelve 400 ("comment, element, and elementPath are required"),
+        // aunque esté presente — por eso "Enviar MCP" fallaba siempre.
+        elementPath: "requerimiento",
+        timestamp: Date.now(),
+        // mcpSent se pone recién cuando el server lo confirma, más abajo — no
+        // acá: sin esto el badge decía "✓ MCP" con el server caído y el
+        // requerimiento se perdía en el camino sin ningún aviso (#reportado).
+        ...(r.page_url ? { url: r.page_url } : {}),
+        ...(endpoint && currentSessionId ? { sessionId: currentSessionId, status: "pending" as const } : {}),
+      };
+      setAnnotations((prev) => [...prev, nueva]);
+      if (!endpoint || !currentSessionId) return;
+
+      setReqMcpError(null);
+      setReqMcpEnviando(r.id);
+      syncAnnotation(endpoint, currentSessionId, nueva)
+        .then((serverAnnotation) => {
+          setAnnotations((prev) =>
+            prev.map((a) =>
+              a.id === nueva.id ? { ...a, id: serverAnnotation.id, mcpSent: true } : a,
+            ),
+          );
+        })
+        .catch((error) => {
+          console.warn("[Agentation] Failed to sync requerimiento to MCP:", error);
+          setReqMcpError(r.id);
+          // Se saca del panel: se quedaba mostrando el requerimiento como si ya
+          // estuviera en la cola, sin el check verde pero también sin decir que
+          // en realidad no llegó a ningún lado.
+          setAnnotations((prev) => prev.filter((a) => a.id !== nueva.id));
+        })
+        .finally(() => setReqMcpEnviando((id) => (id === r.id ? null : id)));
+    },
+    [endpoint, currentSessionId],
   );
 
   // Cancel annotation with exit animation
@@ -2933,7 +3217,11 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
   // popup, para mostrarlo como thumbnail y poder enviarlo al crear. captureDomRegion
   // oculta la UI de agentation durante la captura.
   useEffect(() => {
-    if (!requerimientoMode) return;
+    // "Solo marcar" salta la captura también en modo requerimiento.
+    if (!requerimientoMode || settings.soloMarcar) {
+      setPendingScreenshot(null);
+      return;
+    }
     if (!pendingAnnotation || !pendingAnnotation.boundingBox) {
       setPendingScreenshot(null);
       return;
@@ -2952,7 +3240,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
     return () => {
       cancelled = true;
     };
-  }, [requerimientoMode, pendingAnnotation]);
+  }, [requerimientoMode, pendingAnnotation, settings.soloMarcar]);
 
   // Delete annotation with exit animation
   const deleteAnnotation = useCallback(
@@ -3308,7 +3596,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
         for (const p of samplePoints) {
           const el = deepElementFromPoint(p.x, p.y);
           if (!el || seenElements.has(el)) continue;
-          if (closestCrossingShadow(el, "[data-feedback-toolbar]")) continue;
+          if (closestCrossingShadow(el, SEL_IGNORAR)) continue;
           seenElements.add(el);
           const { name } = identifyElement(el);
           if (!elementNames.includes(name)) {
@@ -4086,8 +4374,81 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
                 onClick={(e) => {
                   e.stopPropagation();
                   hideTooltipsUntilMouseLeave();
+                  if (showSettings) setShowSettings(false);
+                  if (showChanges) setShowChanges(false);
+                  setShowEstado((v) => !v);
+                }}
+                data-active={showEstado}
+              >
+                <IconChatEllipsis size={24} />
+                {hasAnnotations && (
+                  <span className={styles.buttonBadge}>
+                    {annotations.length}
+                  </span>
+                )}
+              </button>
+              <span className={styles.buttonTooltip}>Estado</span>
+            </div>
+
+            {requerimientosUrl && (
+              <div className={styles.buttonWrapper}>
+                <button
+                  className={styles.controlButton}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    hideTooltipsUntilMouseLeave();
+                    if (showSettings) setShowSettings(false);
+                    if (showChanges) setShowChanges(false);
+                    if (showEstado) setShowEstado(false);
+                    setShowReqs((v) => {
+                      const next = !v;
+                      if (next) cargarReqs();
+                      return next;
+                    });
+                  }}
+                  data-active={showReqs}
+                >
+                  <IconClipboardCheck size={24} />
+                  {reqs.filter((r) => r.status === "abierto" || r.status === "en_progreso").length > 0 && (
+                    <span className={styles.buttonBadge}>
+                      {reqs.filter((r) => r.status === "abierto" || r.status === "en_progreso").length}
+                    </span>
+                  )}
+                </button>
+                <span className={styles.buttonTooltip}>Requerimientos</span>
+              </div>
+            )}
+
+            {/* Solo marcar (sin captura) — mismo toggle que en Ajustes, a un
+                clic. Se tiñe de acento cuando está activo. */}
+            <div className={styles.buttonWrapper}>
+              <button
+                className={styles.controlButton}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  hideTooltipsUntilMouseLeave();
+                  setSettings((s) => ({ ...s, soloMarcar: !s.soloMarcar }));
+                }}
+                data-active={settings.soloMarcar}
+                style={settings.soloMarcar ? { color: "var(--agentation-color-accent)" } : undefined}
+              >
+                <IconEdit size={22} />
+              </button>
+              <span className={styles.buttonTooltip}>
+                {settings.soloMarcar ? "Solo marcar: activo" : "Solo marcar (sin captura)"}
+              </span>
+            </div>
+
+            <div className={styles.buttonWrapper}>
+              <button
+                className={styles.controlButton}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  hideTooltipsUntilMouseLeave();
                   if (isDesignMode) closeDesignMode();
                   if (showChanges) setShowChanges(false);
+                  if (showEstado) setShowEstado(false);
+                  if (showReqs) setShowReqs(false);
                   setShowSettings(!showSettings);
                 }}
               >
@@ -4200,7 +4561,7 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
                 const startY = e.clientY;
 
                 // Find toolbar bottom for distance-based scaling
-                const toolbar = (e.target as HTMLElement).closest("[data-feedback-toolbar]");
+                const toolbar = (e.target as HTMLElement).closest(SEL_IGNORAR);
                 const toolbarTop = toolbar?.getBoundingClientRect().top ?? window.innerHeight;
 
                 const onMove = (ev: MouseEvent) => {
@@ -4269,6 +4630,719 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
                 window.addEventListener("mouseup", onUp);
               }}
             />
+
+          {showEstado && (
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                position: "absolute",
+                bottom: "72px",
+                right: "12px",
+                width: "300px",
+                maxHeight: "50vh",
+                overflowY: "auto",
+                background: "#1a1a1a",
+                border: "1px solid rgba(255,255,255,0.1)",
+                borderRadius: "12px",
+                boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+                padding: "8px",
+                zIndex: 2147483000,
+                color: "#fff",
+                fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "4px 6px 8px" }}>
+                <span style={{ fontSize: "11px", fontWeight: 700, color: "rgba(255,255,255,0.55)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                  Estado de las anotaciones ({annotations.length})
+                </span>
+                {(annotations.length > 0 || Object.keys(historial).length > 0) && (
+                  <button
+                    onClick={() => {
+                      if (estadoTab === "hechos") { setHistorial({}); persistirHistorial({}); }
+                      else annotations.slice().forEach((a) => deleteAnnotation(a.id));
+                    }}
+                    title={estadoTab === "hechos" ? "Vaciar el historial" : "Borrar todas las anotaciones"}
+                    style={{ marginLeft: "auto", fontSize: "10px", fontWeight: 600, padding: "3px 8px", borderRadius: "6px", border: "1px solid rgba(248,113,113,0.4)", background: "transparent", color: "rgba(248,113,113,0.9)", cursor: "pointer", whiteSpace: "nowrap" }}
+                  >
+                    Borrar todas
+                  </button>
+                )}
+              </div>
+              {/* Tabs: Pendientes vs Hechos (marcadas resueltas por el agente) */}
+              <div style={{ display: "flex", gap: "4px", padding: "0 6px 8px" }}>
+                {([["pendientes", "Pendientes"], ["hechos", "Hechos"]] as const).map(([k, l]) => {
+                  const n = k === "pendientes"
+                    ? annotations.filter((a) => !a.resolvedAt).length
+                    : Object.keys(historial).length;
+                  const activo = estadoTab === k;
+                  return (
+                    <button
+                      key={k}
+                      onClick={() => setEstadoTab(k)}
+                      style={{
+                        flex: 1,
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        padding: "5px 8px",
+                        borderRadius: "7px",
+                        border: "none",
+                        cursor: "pointer",
+                        background: activo ? "rgba(139,92,246,0.9)" : "rgba(255,255,255,0.06)",
+                        color: activo ? "#fff" : "rgba(255,255,255,0.6)",
+                      }}
+                    >
+                      {l} <span style={{ opacity: 0.7 }}>{n}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              {(() => {
+                const lista = estadoTab === "pendientes"
+                  ? annotations.filter((a) => !a.resolvedAt)
+                  : Object.values(historial).sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+                if (lista.length === 0) {
+                  return (
+                    <div style={{ fontSize: "12px", color: "rgba(255,255,255,0.4)", padding: "10px", textAlign: "center" }}>
+                      {estadoTab === "pendientes" ? "Sin pendientes." : "Nada hecho todavía."}
+                    </div>
+                  );
+                }
+                return lista.map((a) => {
+                  const est = a.aprobada
+                    ? { txt: "✓ Aprobada", bg: "rgba(34,197,94,0.9)" }
+                    : a.resolvedAt
+                      ? { txt: "Por aprobar", bg: "rgba(139,92,246,0.9)" }
+                      : a.mcpSent
+                        ? { txt: "✓ MCP", bg: "rgba(34,197,94,0.9)" }
+                        : { txt: "⏳ Pendiente", bg: "rgba(234,179,8,0.9)" };
+                  const reqMatch = (a.comment || "").match(/Requerimiento #(\d+)/);
+                  const textoCompleto = a.comment || a.element || "";
+                  const primeraLinea = textoCompleto.split("\n").find((l) => l && !l.startsWith("🔗")) || textoCompleto.split("\n")[0];
+                  const expandida = estadoExpandido.has(a.id);
+                  // La captura: la miniatura suya (data URL) o, si ya se subió,
+                  // la URL pública. Sin esto "Ver completa" solo mostraba el
+                  // texto y el 🖼 quedaba como una URL suelta, sin la imagen de
+                  // verdad — que es lo que hace falta para decidir si aprobar.
+                  const imagenAnotacion = a.screenshotUrl || a.screenshot;
+                  // Vale la pena el botón cuando hay más texto que la primera
+                  // línea (el 🔗 del requerimiento, el 📁 del archivo, el 🖼 de
+                  // la captura) O cuando hay una imagen para mostrar — un
+                  // comentario de una sola línea sin captura no gana nada con
+                  // "Ver completa".
+                  const hayMasTexto = textoCompleto.trim() !== primeraLinea.trim() || !!imagenAnotacion;
+                  return (
+                    <div
+                      key={a.id}
+                      style={{ display: "flex", alignItems: expandida ? "flex-start" : "center", gap: "8px", padding: "6px", borderRadius: "8px" }}
+                    >
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div
+                          style={
+                            expandida
+                              ? { fontSize: "12px", whiteSpace: "pre-wrap", overflowWrap: "break-word" }
+                              : { fontSize: "12px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }
+                          }
+                        >
+                          {expandida ? textoCompleto : primeraLinea}
+                        </div>
+                        {expandida && imagenAnotacion && (
+                          <img
+                            src={imagenAnotacion}
+                            alt="Captura de la anotación"
+                            style={{ display: "block", marginTop: "6px", maxWidth: "100%", maxHeight: "220px", borderRadius: "6px", border: "1px solid rgba(255,255,255,0.12)", cursor: "zoom-in" }}
+                            onClick={(ev) => {
+                              ev.stopPropagation();
+                              window.open(imagenAnotacion, "_blank", "noopener,noreferrer");
+                            }}
+                          />
+                        )}
+                        {/* Fecha y el toggle van en líneas separadas — no en la
+                            misma fila flex: un panel angosto partía "Ver
+                            menos" a la mitad entre el medio de la fecha. */}
+                        <div style={{ fontSize: "9.5px", color: "rgba(255,255,255,0.4)", marginTop: "2px", whiteSpace: "nowrap" }}>
+                          {reqMatch ? `#${reqMatch[1]} · ` : ""}{new Date(a.timestamp).toLocaleString("es-CL", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
+                        </div>
+                        {hayMasTexto && (
+                          <button
+                            onClick={(ev) => {
+                              ev.stopPropagation();
+                              setEstadoExpandido((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(a.id)) next.delete(a.id); else next.add(a.id);
+                                return next;
+                              });
+                            }}
+                            style={{ display: "block", marginTop: "2px", fontSize: "9.5px", fontWeight: 600, color: "rgba(167,139,250,0.95)", background: "transparent", border: "none", padding: 0, cursor: "pointer" }}
+                          >
+                            {expandida ? "Ver menos" : "Ver completa"}
+                          </button>
+                        )}
+                      </div>
+                      <span style={{ flexShrink: 0, fontSize: "9px", fontWeight: 700, padding: "2px 6px", borderRadius: "5px", background: est.bg, color: "#fff", whiteSpace: "nowrap" }}>
+                        {est.txt}
+                      </span>
+                      {a.resolvedAt && !a.aprobada && (
+                        <button
+                          onClick={async (ev) => {
+                            ev.stopPropagation();
+                            const reqId = reqMatch ? Number(reqMatch[1]) : null;
+                            if (reqId && onUpdateRequerimientoStatus) {
+                              // Aprobar = "quedó listo, esperando el visto bueno final":
+                              // pasa la ficha a Pendiente de confirmación, no a Cerrado.
+                              await onUpdateRequerimientoStatus(reqId, "por_confirmar");
+                            }
+                            setAnnotations((prev) => prev.map((x) => (x.id === a.id ? { ...x, aprobada: true } : x)));
+                            setHistorial((prev) => {
+                              const next = { ...prev, [a.id]: { ...(prev[a.id] ?? a), aprobada: true } };
+                              persistirHistorial(next);
+                              return next;
+                            });
+                          }}
+                          title={reqMatch ? `Aprobar y cerrar el requerimiento #${reqMatch[1]}` : "Aprobar"}
+                          style={{ flexShrink: 0, fontSize: "10px", fontWeight: 700, padding: "4px 8px", borderRadius: "6px", border: "none", background: "rgba(34,197,94,0.9)", color: "#fff", cursor: "pointer", whiteSpace: "nowrap" }}
+                        >
+                          ✓ Aprobar
+                        </button>
+                      )}
+                      <button
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          deleteAnnotation(a.id);
+                          setHistorial((prev) => {
+                            if (!prev[a.id]) return prev;
+                            const next = { ...prev };
+                            delete next[a.id];
+                            persistirHistorial(next);
+                            return next;
+                          });
+                        }}
+                        title="Borrar esta anotación"
+                        style={{ flexShrink: 0, width: "22px", height: "22px", display: "grid", placeItems: "center", borderRadius: "6px", border: "none", background: "transparent", color: "rgba(255,255,255,0.4)", cursor: "pointer", fontSize: "13px" }}
+                        onMouseEnter={(ev) => { ev.currentTarget.style.background = "rgba(248,113,113,0.2)"; ev.currentTarget.style.color = "rgba(248,113,113,0.95)"; }}
+                        onMouseLeave={(ev) => { ev.currentTarget.style.background = "transparent"; ev.currentTarget.style.color = "rgba(255,255,255,0.4)"; }}
+                      >
+                        🗑
+                      </button>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+          )}
+
+          {showReqs && (() => {
+            const EST: Record<string, { t: string; bg: string }> = {
+              abierto: { t: "Abierto", bg: "rgba(59,130,246,0.9)" },
+              en_progreso: { t: "En progreso", bg: "rgba(234,179,8,0.9)" },
+              por_confirmar: { t: "Por confirmar", bg: "rgba(139,92,246,0.9)" },
+              cerrado: { t: "Cerrado", bg: "rgba(34,197,94,0.9)" },
+              silenciado: { t: "Silenciado", bg: "rgba(255,255,255,0.2)" },
+            };
+            const PRIO: Record<string, { t: string; bg: string }> = {
+              urgente: { t: "Urgente", bg: "rgba(248,113,113,0.9)" },
+              alta: { t: "Alta", bg: "rgba(234,179,8,0.9)" },
+              media: { t: "Media", bg: "rgba(59,130,246,0.7)" },
+              baja: { t: "Baja", bg: "rgba(255,255,255,0.18)" },
+              sin_priorizar: { t: "Sin prio", bg: "rgba(255,255,255,0.18)" },
+            };
+            const CHIPS: { v: string; t: string }[] = [
+              { v: "vivos", t: "Vivos" }, { v: "", t: "Todos" },
+              { v: "abierto", t: "Abierto" }, { v: "en_progreso", t: "En progreso" },
+              { v: "por_confirmar", t: "Por confirmar" }, { v: "cerrado", t: "Cerrado" },
+              { v: "silenciado", t: "Silenciado" },
+            ];
+            const pasaEstado = (r: RequerimientoLite) =>
+              reqsEstado === "vivos" ? (r.status === "abierto" || r.status === "en_progreso")
+                : reqsEstado === "" ? true : r.status === reqsEstado;
+            const pasaPersona = (r: RequerimientoLite) =>
+              reqsPersona === "" ? true : (r.responsable ?? "· Sin asignar") === reqsPersona;
+            // Conteo por responsable (respetando el filtro de estado activo), para
+            // el selector "Cualquier responsable · Nombre (N)".
+            const conteoPersona = new Map<string, number>();
+            reqs.filter(pasaEstado).forEach((r) => {
+              const k = r.responsable ?? "· Sin asignar";
+              conteoPersona.set(k, (conteoPersona.get(k) ?? 0) + 1);
+            });
+            const personas = Array.from(conteoPersona.keys()).sort((a, b) => {
+              if (a === "· Sin asignar") return 1;
+              if (b === "· Sin asignar") return -1;
+              return a.localeCompare(b);
+            });
+            // Orden de los PRIMEROS a los últimos (ascendente por creación).
+            const visibles = reqs
+              .filter((r) => pasaEstado(r) && pasaPersona(r))
+              .sort((a, b) =>
+                (a.created_at ?? a.updated_at ?? "").localeCompare(b.created_at ?? b.updated_at ?? ""),
+              );
+            const fecha = (s?: string) =>
+              s ? new Date(s).toLocaleDateString("es-CL", { day: "2-digit", month: "2-digit", year: "2-digit" }) : "";
+            const det = reqDetalleId != null ? reqs.find((r) => r.id === reqDetalleId) ?? null : null;
+            const detE = det ? (EST[det.status] ?? EST.abierto) : null;
+            const detP = det ? (PRIO[det.priority] ?? PRIO.sin_priorizar) : null;
+            // La imagen se sirve por el mismo endpoint+key que la lista:
+            // /reqsync/{id}/screenshot?key=…  (derivado de requerimientosUrl).
+            const [reqBase, reqQuery] = (requerimientosUrl ?? "").split("?");
+            const shotUrl = (id: number) =>
+              reqBase ? `${reqBase}/${id}/screenshot${reqQuery ? "?" + reqQuery : ""}` : null;
+            const cambiarEstado = async (id: number, nuevo: string, prev: string) => {
+              setReqs((rs) => rs.map((x) => (x.id === id ? { ...x, status: nuevo } : x)));
+              const ok = onUpdateRequerimientoStatus
+                ? await onUpdateRequerimientoStatus(id, nuevo)
+                : false;
+              if (!ok) setReqs((rs) => rs.map((x) => (x.id === id ? { ...x, status: prev } : x)));
+            };
+            const ESTADOS_SEG: { v: string; t: string }[] = [
+              { v: "abierto", t: "Abierto" },
+              { v: "en_progreso", t: "En progreso" },
+              { v: "por_confirmar", t: "Pendiente de confirmación" },
+              { v: "cerrado", t: "Cerrado" },
+              { v: "silenciado", t: "Silenciado" },
+            ];
+            return (
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                position: "absolute",
+                bottom: "72px",
+                right: "12px",
+                width: "520px",
+                maxHeight: "78vh",
+                display: "flex",
+                flexDirection: "column",
+                background: "#1a1a1a",
+                border: "1px solid rgba(255,255,255,0.1)",
+                borderRadius: "14px",
+                boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
+                zIndex: 2147483000,
+                color: "#fff",
+                fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+                overflow: "hidden",
+                transformOrigin: "bottom right",
+                opacity: reqDrawerIn ? 1 : 0,
+                transform: reqDrawerIn ? "translateY(0) scale(1)" : "translateY(10px) scale(0.98)",
+                transition: "opacity 0.18s ease, transform 0.22s cubic-bezier(0.32,0.72,0,1)",
+              }}
+            >
+              {/* Cabecera */}
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "12px 14px", borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
+                <span style={{ fontSize: "13px", fontWeight: 700 }}>Requerimientos</span>
+                <span style={{ fontSize: "11px", color: "rgba(255,255,255,0.45)" }}>
+                  {visibles.length} de {reqs.length}
+                </span>
+                <button
+                  onClick={cargarReqs}
+                  title="Refrescar"
+                  style={{ marginLeft: "auto", fontSize: "14px", padding: "4px 9px", borderRadius: "7px", border: "none", cursor: "pointer", background: "rgba(255,255,255,0.08)", color: "rgba(255,255,255,0.7)" }}
+                >
+                  {reqsLoading ? "…" : "↻"}
+                </button>
+                <button
+                  onClick={() => { setShowReqs(false); setReqDetalleId(null); setIsActive(false); }}
+                  style={{ fontSize: "15px", padding: "4px 9px", borderRadius: "7px", border: "none", cursor: "pointer", background: "rgba(255,255,255,0.08)", color: "rgba(255,255,255,0.7)" }}
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* Filtros */}
+              <div style={{ padding: "10px 14px", borderBottom: "1px solid rgba(255,255,255,0.08)", display: "flex", flexDirection: "column", gap: "8px" }}>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "5px" }}>
+                  {CHIPS.map((c) => (
+                    <button
+                      key={c.v || "todos"}
+                      onClick={() => setReqsEstado(c.v)}
+                      style={{
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        padding: "4px 10px",
+                        borderRadius: "7px",
+                        border: "none",
+                        cursor: "pointer",
+                        background: reqsEstado === c.v ? "rgba(139,92,246,0.9)" : "rgba(255,255,255,0.07)",
+                        color: reqsEstado === c.v ? "#fff" : "rgba(255,255,255,0.6)",
+                      }}
+                    >
+                      {c.t}
+                    </button>
+                  ))}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <span style={{ fontSize: "11px", color: "rgba(255,255,255,0.45)" }}>Persona</span>
+                  <select
+                    value={reqsPersona}
+                    onChange={(ev) => setReqsPersona(ev.target.value)}
+                    style={{
+                      flex: 1,
+                      fontSize: "12px",
+                      padding: "5px 8px",
+                      borderRadius: "7px",
+                      border: "1px solid rgba(255,255,255,0.12)",
+                      background: "#242424",
+                      color: "#fff",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <option value="">Cualquier responsable</option>
+                    {personas.map((p) => (
+                      <option key={p} value={p}>
+                        {(p === "· Sin asignar" ? "Sin asignar" : p) + ` (${conteoPersona.get(p) ?? 0})`}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              {/* Lista */}
+              <div style={{ overflowY: "auto", padding: "8px" }}>
+                {reqsLoading && reqs.length === 0 && (
+                  <div style={{ fontSize: "12px", color: "rgba(255,255,255,0.4)", padding: "14px", textAlign: "center" }}>Cargando…</div>
+                )}
+                {reqsError && (
+                  <div style={{ fontSize: "12px", color: "rgba(248,113,113,0.9)", padding: "14px", textAlign: "center" }}>
+                    No se pudo cargar.
+                  </div>
+                )}
+                {!reqsLoading && !reqsError && visibles.length === 0 && (
+                  <div style={{ fontSize: "12px", color: "rgba(255,255,255,0.4)", padding: "14px", textAlign: "center" }}>Nada con estos filtros.</div>
+                )}
+                {!reqsLoading && !reqsError && (() => {
+                  const GRUPO_ORDEN = ["en_progreso", "abierto", "por_confirmar", "cerrado", "silenciado"];
+                  // "Pendiente de confirmación": solo las de las últimas 24h.
+                  const hace24h = Date.now() - 24 * 60 * 60 * 1000;
+                  const grupos = GRUPO_ORDEN
+                    .map((st) => {
+                      let items = visibles.filter((r) => r.status === st);
+                      if (st === "por_confirmar") {
+                        items = items.filter((r) => {
+                          const t = new Date(r.updated_at ?? r.created_at ?? 0).getTime();
+                          return Number.isFinite(t) && t >= hace24h;
+                        });
+                      }
+                      return { st, items };
+                    })
+                    .filter((g) => g.items.length > 0);
+                  return grupos.map((g) => {
+                    const ge = EST[g.st] ?? EST.abierto;
+                    const colapsado = !!reqColapsados[g.st];
+                    return (
+                      <div key={g.st} style={{ marginBottom: "8px" }}>
+                        {/* Cabecera de grupo colapsable */}
+                        <div
+                          onClick={() => setReqColapsados((c) => ({ ...c, [g.st]: !c[g.st] }))}
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "8px",
+                            padding: "6px 8px",
+                            marginBottom: "4px",
+                            borderRadius: "8px",
+                            cursor: "pointer",
+                            background: "rgba(255,255,255,0.03)",
+                            userSelect: "none",
+                          }}
+                        >
+                          <span style={{ fontSize: "10px", color: "rgba(255,255,255,0.5)", width: "12px" }}>{colapsado ? "▸" : "▾"}</span>
+                          <span style={{ width: "9px", height: "9px", borderRadius: "50%", background: ge.bg, flexShrink: 0 }} />
+                          <span style={{ fontSize: "12px", fontWeight: 700, color: "rgba(255,255,255,0.85)" }}>{ge.t}</span>
+                          <span style={{ fontSize: "11px", color: "rgba(255,255,255,0.4)" }}>{g.items.length}</span>
+                        </div>
+                        {!colapsado && g.items.map((r) => {
+                  const e = EST[r.status] ?? EST.abierto;
+                  const p = PRIO[r.priority] ?? PRIO.sin_priorizar;
+                  return (
+                    <div
+                      key={r.id}
+                      onClick={() => setReqDetalleId(r.id)}
+                      style={{
+                        display: "flex",
+                        gap: "10px",
+                        alignItems: "flex-start",
+                        padding: "10px",
+                        marginBottom: "6px",
+                        borderRadius: "10px",
+                        background: "rgba(255,255,255,0.04)",
+                        border: "1px solid rgba(255,255,255,0.06)",
+                        cursor: "pointer",
+                      }}
+                      onMouseEnter={(ev) => (ev.currentTarget.style.background = "rgba(255,255,255,0.08)")}
+                      onMouseLeave={(ev) => (ev.currentTarget.style.background = "rgba(255,255,255,0.04)")}
+                    >
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                      {/* Fila 1: id + estado (editable) + prioridad + flags */}
+                      <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "5px", flexWrap: "wrap" }}>
+                        <span style={{ fontSize: "11px", color: "rgba(255,255,255,0.4)", fontFamily: "monospace" }}>#{r.id}</span>
+                        {onUpdateRequerimientoStatus ? (
+                          <select
+                            value={r.status}
+                            onClick={(ev) => ev.stopPropagation()}
+                            onChange={async (ev) => {
+                              const nuevo = ev.target.value;
+                              const prev = r.status;
+                              setReqs((rs) => rs.map((x) => (x.id === r.id ? { ...x, status: nuevo } : x)));
+                              const ok = await onUpdateRequerimientoStatus(r.id, nuevo);
+                              if (!ok) setReqs((rs) => rs.map((x) => (x.id === r.id ? { ...x, status: prev } : x)));
+                            }}
+                            style={{
+                              fontSize: "10px",
+                              fontWeight: 700,
+                              padding: "3px 6px",
+                              borderRadius: "6px",
+                              background: e.bg,
+                              color: "#fff",
+                              border: "none",
+                              cursor: "pointer",
+                              appearance: "none",
+                            }}
+                          >
+                            <option value="abierto">Abierto</option>
+                            <option value="en_progreso">En progreso</option>
+                            <option value="por_confirmar">Por confirmar</option>
+                            <option value="cerrado">Cerrado</option>
+                            <option value="silenciado">Silenciado</option>
+                          </select>
+                        ) : (
+                          <span style={{ fontSize: "10px", fontWeight: 700, padding: "3px 7px", borderRadius: "6px", background: e.bg, color: "#fff" }}>{e.t}</span>
+                        )}
+                        <span style={{ fontSize: "10px", fontWeight: 700, padding: "3px 7px", borderRadius: "6px", background: p.bg, color: "#fff" }}>{p.t}</span>
+                        {r.reopened_at && (
+                          <span style={{ fontSize: "9px", fontWeight: 700, padding: "3px 6px", borderRadius: "6px", background: "rgba(248,113,113,0.9)", color: "#fff" }}>reabierto</span>
+                        )}
+                        {r.source === "mcp" && (
+                          <span style={{ fontSize: "9px", fontWeight: 700, padding: "3px 6px", borderRadius: "6px", background: "rgba(139,92,246,0.9)", color: "#fff" }}>MCP</span>
+                        )}
+                        <span style={{ marginLeft: "auto", fontSize: "15px", color: "rgba(255,255,255,0.35)" }}>›</span>
+                      </div>
+
+                      {/* Título / problema */}
+                      <div style={{ fontSize: "13px", fontWeight: 500, lineHeight: 1.3, marginBottom: "5px" }}>
+                        {r.title || r.problem}
+                      </div>
+
+                      {/* Meta: persona + reportó + fecha + url */}
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: "10px", fontSize: "10.5px", color: "rgba(255,255,255,0.45)" }}>
+                        <span>👤 {r.responsable ?? "Sin asignar"}</span>
+                        {r.reported_by && <span>✎ {r.reported_by}</span>}
+                        {r.updated_at && <span>🕑 {fecha(r.updated_at)}</span>}
+                      </div>
+                      {r.page_url && (
+                        <a
+                          href={`${r.page_url}${r.page_url.includes("?") ? "&" : "?"}agReq=${r.id}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          onClick={(ev) => ev.stopPropagation()}
+                          title="Abrir la pantalla y reabrir esta ficha ahí"
+                          style={{ display: "block", fontSize: "10px", color: "rgba(139,120,246,0.85)", marginTop: "3px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: "none" }}
+                        >
+                          {r.page_url} ↗
+                        </a>
+                      )}
+                      </div>
+                      {/* Miniatura del screenshot (se oculta sola si la ficha no tiene) */}
+                      {shotUrl(r.id) && (
+                        <img
+                          src={shotUrl(r.id) as string}
+                          alt=""
+                          style={{ width: "84px", height: "60px", objectFit: "cover", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.1)", flexShrink: 0, background: "rgba(255,255,255,0.04)" }}
+                          onError={(ev) => { ev.currentTarget.style.display = "none"; }}
+                        />
+                      )}
+                    </div>
+                  );
+                        })}
+                      </div>
+                    );
+                  });
+                })()}
+              </div>
+
+              {/* Detalle deslizante — entra desde la derecha, sin salir del panel */}
+              <div
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  background: "#1a1a1a",
+                  display: "flex",
+                  flexDirection: "column",
+                  transform: det ? "translateX(0)" : "translateX(100%)",
+                  transition: "transform 0.22s cubic-bezier(0.4,0,0.2,1)",
+                  boxShadow: det ? "-8px 0 24px rgba(0,0,0,0.4)" : "none",
+                }}
+              >
+                {det && detE && detP && (
+                  <>
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "12px 14px", borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
+                      <button
+                        onClick={() => setReqDetalleId(null)}
+                        style={{ fontSize: "13px", fontWeight: 600, padding: "5px 10px", borderRadius: "7px", border: "none", cursor: "pointer", background: "rgba(255,255,255,0.08)", color: "rgba(255,255,255,0.8)" }}
+                      >
+                        ‹ Volver
+                      </button>
+                      <span style={{ fontSize: "11px", color: "rgba(255,255,255,0.4)", fontFamily: "monospace" }}>#{det.id}</span>
+                      <button
+                        onClick={() => {
+                          // Enlazamos la próxima anotación a esta ficha (con su título
+                          // y descripción, para prellenar el form), cerramos el panel y
+                          // activamos el marcado en pantalla.
+                          reqVinculoRef.current = {
+                            id: det.id,
+                            titulo: det.title || det.problem,
+                            descripcion: det.problem,
+                          };
+                          setShowReqs(false);
+                          setReqDetalleId(null);
+                          setIsActive(true);
+                        }}
+                        title="Marcar en pantalla y enlazar a esta ficha"
+                        style={{ marginLeft: "auto", fontSize: "11px", fontWeight: 600, padding: "5px 10px", borderRadius: "7px", border: "none", background: "rgba(139,92,246,0.95)", color: "#fff", cursor: "pointer" }}
+                      >
+                        📍 Marcar
+                      </button>
+                      <button
+                        onClick={() => enviarRequerimientoAlMcp(det)}
+                        disabled={reqMcpEnviando === det.id}
+                        title={
+                          reqMcpError === det.id
+                            ? "No llegó al servidor del MCP — click para reintentar"
+                            : "Mandar este requerimiento al MCP tal como está, sin marcar nada en pantalla"
+                        }
+                        style={{
+                          fontSize: "11px", fontWeight: 600, padding: "5px 10px", borderRadius: "7px", border: "none", color: "#fff",
+                          cursor: reqMcpEnviando === det.id ? "default" : "pointer",
+                          opacity: reqMcpEnviando === det.id ? 0.6 : 1,
+                          background: reqMcpError === det.id ? "rgba(248,113,113,0.9)" : "rgba(34,197,94,0.9)",
+                        }}
+                      >
+                        {reqMcpEnviando === det.id ? "Enviando…" : reqMcpError === det.id ? "No llegó — reintentar" : "Enviar MCP"}
+                      </button>
+                      {onOpenRequerimiento && (
+                        <button
+                          onClick={() => onOpenRequerimiento(det.id)}
+                          title="Abrir en la app"
+                          style={{ fontSize: "11px", padding: "5px 10px", borderRadius: "7px", border: "1px solid rgba(255,255,255,0.14)", background: "transparent", color: "rgba(255,255,255,0.7)", cursor: "pointer" }}
+                        >
+                          Abrir ↗
+                        </button>
+                      )}
+                      <button
+                        onClick={() => { setShowReqs(false); setReqDetalleId(null); setIsActive(false); }}
+                        style={{ marginLeft: "0", fontSize: "15px", padding: "4px 9px", borderRadius: "7px", border: "none", cursor: "pointer", background: "rgba(255,255,255,0.08)", color: "rgba(255,255,255,0.7)" }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                    <div style={{ overflowY: "auto", padding: "14px", display: "flex", flexDirection: "column", gap: "14px" }}>
+                      {/* ESTADO — control segmentado */}
+                      <div>
+                        <div style={{ fontSize: "10px", fontWeight: 700, color: "rgba(255,255,255,0.4)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "7px" }}>Estado</div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: "5px", background: "rgba(255,255,255,0.05)", padding: "4px", borderRadius: "10px" }}>
+                          {ESTADOS_SEG.map((s) => {
+                            const activo = det.status === s.v;
+                            return (
+                              <button
+                                key={s.v}
+                                disabled={!onUpdateRequerimientoStatus}
+                                onClick={() => { if (!activo) cambiarEstado(det.id, s.v, det.status); }}
+                                style={{
+                                  fontSize: "12px",
+                                  fontWeight: 600,
+                                  padding: "6px 12px",
+                                  borderRadius: "8px",
+                                  border: "none",
+                                  cursor: onUpdateRequerimientoStatus ? "pointer" : "default",
+                                  background: activo ? "rgba(139,92,246,0.95)" : "transparent",
+                                  color: activo ? "#fff" : "rgba(255,255,255,0.6)",
+                                }}
+                              >
+                                {s.t}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Prioridad + flags */}
+                      <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                        <span style={{ fontSize: "11px", fontWeight: 700, padding: "4px 9px", borderRadius: "6px", background: detP.bg, color: "#fff" }}>{detP.t}</span>
+                        {det.reopened_at && (
+                          <span style={{ fontSize: "10px", fontWeight: 700, padding: "4px 8px", borderRadius: "6px", background: "rgba(248,113,113,0.9)", color: "#fff" }}>reabierto</span>
+                        )}
+                        {det.source === "mcp" && (
+                          <span style={{ fontSize: "10px", fontWeight: 700, padding: "4px 8px", borderRadius: "6px", background: "rgba(139,92,246,0.9)", color: "#fff" }}>MCP</span>
+                        )}
+                      </div>
+
+                      {/* Screenshot — intento cargarlo siempre; si no existe (404)
+                          se oculta solo (no dependemos del flag, que puede venir
+                          viejo en los datos ya cargados). */}
+                      {shotUrl(det.id) && (
+                        <a
+                          href={shotUrl(det.id) as string}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{ display: "block" }}
+                          onClick={(ev) => ev.stopPropagation()}
+                        >
+                          <img
+                            src={shotUrl(det.id) as string}
+                            alt={`Screenshot #${det.id}`}
+                            style={{ width: "100%", borderRadius: "10px", border: "1px solid rgba(255,255,255,0.1)", display: "block" }}
+                            onError={(ev) => {
+                              const a = (ev.currentTarget.parentElement as HTMLElement | null);
+                              if (a) a.style.display = "none";
+                            }}
+                          />
+                        </a>
+                      )}
+
+                      {/* Título (seleccionable + copiar) */}
+                      {det.title && (
+                        <div style={{ display: "flex", alignItems: "flex-start", gap: "8px" }}>
+                          <div style={{ flex: 1, fontSize: "16px", fontWeight: 600, lineHeight: 1.3, userSelect: "text", WebkitUserSelect: "text", cursor: "text" }}>{det.title}</div>
+                          <button
+                            onClick={() => navigator.clipboard?.writeText(det.title ?? "")}
+                            title="Copiar título"
+                            style={{ flexShrink: 0, fontSize: "11px", padding: "3px 8px", borderRadius: "6px", border: "1px solid rgba(255,255,255,0.14)", background: "transparent", color: "rgba(255,255,255,0.7)", cursor: "pointer" }}
+                          >
+                            ⧉
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Problema completo (seleccionable + copiar) */}
+                      <div>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "4px" }}>
+                          <span style={{ fontSize: "10px", fontWeight: 700, color: "rgba(255,255,255,0.4)", textTransform: "uppercase", letterSpacing: "0.05em" }}>Descripción</span>
+                          <button
+                            onClick={() => navigator.clipboard?.writeText(det.problem)}
+                            title="Copiar descripción"
+                            style={{ marginLeft: "auto", fontSize: "11px", padding: "3px 8px", borderRadius: "6px", border: "1px solid rgba(255,255,255,0.14)", background: "transparent", color: "rgba(255,255,255,0.7)", cursor: "pointer" }}
+                          >
+                            ⧉ copiar
+                          </button>
+                        </div>
+                        <div style={{ fontSize: "13px", lineHeight: 1.5, color: "rgba(255,255,255,0.85)", whiteSpace: "pre-wrap", userSelect: "text", WebkitUserSelect: "text", cursor: "text" }}>{det.problem}</div>
+                      </div>
+
+                      {/* Datos */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "12px", color: "rgba(255,255,255,0.7)", borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "12px" }}>
+                        <div><span style={{ color: "rgba(255,255,255,0.4)" }}>Responsable: </span>{det.responsable ?? "Sin asignar"}</div>
+                        {det.reported_by && <div><span style={{ color: "rgba(255,255,255,0.4)" }}>Reportó: </span>{det.reported_by}</div>}
+                        {det.page_url && (
+                          <div style={{ wordBreak: "break-all" }}>
+                            <span style={{ color: "rgba(255,255,255,0.4)" }}>URL: </span>
+                            <a href={`${det.page_url}${det.page_url.includes("?") ? "&" : "?"}agReq=${det.id}`} target="_blank" rel="noreferrer" title="Abrir la pantalla y reabrir esta ficha ahí" style={{ color: "rgba(139,120,246,0.9)", textDecoration: "none" }}>{det.page_url} ↗</a>
+                          </div>
+                        )}
+                        {det.created_at && <div><span style={{ color: "rgba(255,255,255,0.4)" }}>Creado: </span>{fecha(det.created_at)}</div>}
+                        {det.updated_at && <div><span style={{ color: "rgba(255,255,255,0.4)" }}>Actualizado: </span>{fecha(det.updated_at)}</div>}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+            );
+          })()}
 
           <SettingsPanel
             settings={settings}
@@ -4904,6 +5978,12 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
                       ref={popupRef}
                       element={pendingAnnotation.element}
                       selectedText={pendingAnnotation.selectedText}
+                      nearbyText={pendingAnnotation.nearbyText}
+                      // Si el marcado salió de "📍 Marcar" de un requerimiento,
+                      // prellenamos con el título y la descripción de ESA ficha
+                      // (no del elemento de la pantalla).
+                      tituloInicial={reqVinculoRef.current?.titulo}
+                      initialValue={reqVinculoRef.current?.descripcion ?? ""}
                       computedStyles={pendingAnnotation.computedStylesObj}
                       placeholder={
                         pendingAnnotation.element === "Area selection"
@@ -4920,6 +6000,22 @@ const [settings, setSettings] = useState<ToolbarSettings>(() => {
                       prioridades={prioridades}
                       responsables={responsables}
                       screenshot={pendingScreenshot ?? undefined}
+                      soloMarcar={settings.soloMarcar}
+                      onCopy={(comment) => {
+                        // El output agéntico de ESTA marca (elemento, selector,
+                        // source, texto) al portapapeles. Lo arma el toolbar
+                        // porque tiene el pendingAnnotation completo.
+                        if (!pendingAnnotation) return;
+                        const pathname =
+                          typeof window !== "undefined"
+                            ? window.location.pathname + window.location.search + window.location.hash
+                            : "";
+                        const ann = { ...pendingAnnotation, comment, timestamp: Date.now() } as unknown as Annotation;
+                        const salida = generateOutput([ann], pathname, settings.outputDetail);
+                        if (salida && typeof navigator !== "undefined" && navigator.clipboard) {
+                          navigator.clipboard.writeText(salida).catch(() => {});
+                        }
+                      }}
                       pageUrl={
                         typeof window !== "undefined"
                           ? window.location.pathname + window.location.search + window.location.hash
